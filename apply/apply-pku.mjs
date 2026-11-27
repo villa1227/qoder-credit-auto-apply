@@ -164,6 +164,52 @@ async function clickByText(page, text, { timeoutMs = 0 } = {}) {
 }
 
 /**
+ * Watch for human interaction on the page.
+ * The script and a human in the same browser window fight over the form: the
+ * human edits the reason field while the script clicks, and the result looks
+ * like "the script did not submit". The watcher is armed AFTER the form has
+ * been filled, so the script's own input events are not counted.
+ */
+async function armActivityWatcher(page) {
+  return page.evaluate(`
+    window.__qoderUserActivity = 0;
+    if (!window.__qoderActivityArmed) {
+      window.__qoderActivityArmed = true;
+      for (const evt of ['pointerdown', 'keydown', 'input']) {
+        document.addEventListener(evt, () => { window.__qoderUserActivity += 1; }, true);
+      }
+    }
+    return true;
+  `);
+}
+
+async function readUserActivity(page) {
+  const count = await page.evaluate('return Number(window.__qoderUserActivity || 0);');
+  return Number(count) || 0;
+}
+
+/**
+ * Wait until the page is left alone for a few seconds.
+ * Returns { idle: false } when a human keeps working on it - the caller then
+ * gives up for now and lets the state machine retry later.
+ */
+async function waitForIdleUser(page, timeoutMs = 30000) {
+  let last = await readUserActivity(page);
+  if (last === 0) return { idle: true, activity: 0 };
+  log(`a human touched the form (${last} event(s)) - waiting for it to be idle`);
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    // eslint-disable-next-line no-await-in-loop
+    await sleep(2500);
+    // eslint-disable-next-line no-await-in-loop
+    const now = await readUserActivity(page);
+    if (now === last) return { idle: true, activity: now };
+    last = now;
+  }
+  return { idle: false, activity: last };
+}
+
+/**
  * Locate the submit button and report its state.
  * "Found" is not enough: a disabled button or a stale coordinate means the
  * click would go nowhere, so the state is captured right before the click.
@@ -274,6 +320,10 @@ async function openForm(browser, page, config) {
   while (Date.now() < deadline) {
     attempt += 1;
     const tabsBefore = new Set((await browser.listPages()).map((t) => t.targetId));
+    // A leftover draft prompt covers the button; a click that lands on the
+    // dialog is swallowed and the form never opens. Clear it before clicking.
+    // eslint-disable-next-line no-await-in-loop
+    await dismissDialogs(page, config);
     const clicked = await clickByText(page, applyText, { timeoutMs: 10000 });
     if (clicked?.clicked) {
       log('clicked', applyText, `(attempt ${attempt})`);
@@ -585,6 +635,9 @@ async function main() {
     }
     await page.screenshot(join(ARTIFACT_DIR, 'before-submit.png'));
 
+    // From here on, any input on the page comes from a human.
+    await armActivityWatcher(page);
+
     const submitTexts = config.browser.submitButtonTexts ?? ['立即提交'];
 
     if (dryRun) {
@@ -592,6 +645,18 @@ async function main() {
       console.log(`DRY_RUN_FILLED reason=${reason} field=${JSON.stringify(filled)}`);
       exitCode = 0;
       return;
+    }
+
+    // Do not fight a human over the same form: if someone is still working in
+    // the window, wait for them to stop and only then submit.
+    const idle = await waitForIdleUser(page);
+    if (!idle.idle) {
+      log('the form is still being edited by a human - skipping this submission');
+      console.log(`SKIPPED_USER_ACTIVE reason=${reason}`);
+      throw new Error('USER_ACTIVITY');
+    }
+    if (idle.activity > 0) {
+      log(`the form was edited by a human (${idle.activity} event(s)) - submitting the current content`);
     }
 
     if (mode === 'verify-click') {
