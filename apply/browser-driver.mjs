@@ -57,7 +57,16 @@ export async function launchBrowser({ port = DEFAULT_PORT, profileDir, headless 
     `--user-data-dir=${profileDir}`,
     '--no-first-run',
     '--no-default-browser-check',
-    '--disable-features=msEdgeSidebarV2',
+    // A headed window whose screen is off, that is covered by the lock screen,
+    // or that sits behind another window is "occluded" as far as the browser is
+    // concerned. Without these switches Edge throttles timers and stops drawing,
+    // which makes toasts/dialogs appear late and screenshots come back stale.
+    // The application still signs in and clicks, just unreliably, so keep the
+    // window un-throttled even when nobody is looking at it.
+    '--disable-background-timer-throttling',
+    '--disable-backgrounding-occluded-windows',
+    '--disable-renderer-backgrounding',
+    '--disable-features=msEdgeSidebarV2,CalculateNativeWinOcclusion',
     'about:blank',
   ];
   if (headless) args.unshift('--headless=new');
@@ -259,11 +268,29 @@ export class Page {
     await this.send('Input.dispatchMouseEvent', { type: 'mouseReleased', ...base });
   }
 
+  /**
+   * Best-effort screenshot. When the screen is off or the session is locked the
+   * browser can fail to produce a frame; that must never abort a submission -
+   * the JSON dumps and the toast-based result check carry the evidence.
+   */
   async screenshot(filePath) {
-    const result = await this.send('Page.captureScreenshot', { format: 'png' });
-    const { writeFileSync } = await import('node:fs');
-    writeFileSync(filePath, Buffer.from(result.data, 'base64'));
-    return filePath;
+    try {
+      const pending = this.send('Page.captureScreenshot', { format: 'png' });
+      // A late rejection after the race below must not become an unhandled one.
+      pending.catch(() => {});
+      const result = await Promise.race([
+        pending,
+        sleep(8000).then(() => {
+          throw new Error('SCREENSHOT_TIMEOUT');
+        }),
+      ]);
+      const { writeFileSync } = await import('node:fs');
+      writeFileSync(filePath, Buffer.from(result.data, 'base64'));
+      return filePath;
+    } catch (error) {
+      console.log(`[warn] screenshot skipped (${filePath}): ${error.message}`);
+      return null;
+    }
   }
 
   async bringToFront() {

@@ -64,7 +64,9 @@ node apply/apply-pku.mjs --verify-click
 脚本点完「立即提交」**不会**假设成功，而是等门户给出结果：
 
 1. 点击前记录按钮的 `text` / `disabled` / 坐标（写进 `artifacts/submit-attempts.json`）
-2. 点击后立即截图（`artifacts/submit-click-N.png`）
+2. 点击后立即截图（`artifacts/submit-click-N.png`）。截图是**尽力而为**的：
+   屏幕关闭或会话锁定时浏览器可能拿不到帧，这时只记一条 `[warn] screenshot skipped`，
+   不影响提交判定（判定只看弹窗与消息提示）
 3. 出现「请选择下一个节点审批人」弹窗 → 勾选审批节点（有「全选」就点全选，被禁用就点业务审核那一行）
    → 点「确认」→ 必须看到弹窗真的关闭才算通过（截图与结构存 `artifacts/approver.json`、`approver-N.png`）
 4. 轮询**真正的消息提示**（toast / 页面跳走），最多 15 秒，等「提交成功 / 申请成功 / 受理成功」

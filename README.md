@@ -226,6 +226,15 @@ node apply/apply-pku.mjs --dry-run
   | `Register-ScheduledTask -Force` 覆盖已有任务 | 报 `0x80070005`（拒绝访问） | 先 `Unregister-ScheduledTask` 再注册 |
   | `Stop-ScheduledTask` 杀不掉孙进程 | node 变成孤儿进程，继续写旧目录 | 注册/搬迁时按命令行特征显式清理 node 进程 |
 
+- **不依赖亮屏，但依赖「机器没睡着」**。计划任务、读日志、阈值判断、状态机与亮屏无关：
+  屏保、锁屏、合盖但未睡眠时都照常运行。提交那一步是真实 Edge 窗口 + CDP，
+  点击和读文本并不经过物理鼠标或屏幕；Edge 启动时已关闭后台节流和「窗口被遮挡」检测
+  （`--disable-background-timer-throttling`、`--disable-backgrounding-occluded-windows`、
+  `CalculateNativeWinOcclusion`），截图失败也只记一条 warn，不再中断提交。
+  真正会停的是睡眠 / 现代待机：错过的 tick 不会补跑，醒来后下一分钟继续（机器冻结期间额度也不会被消耗）。
+  所以电源计划里要把「关闭盖子时」设为「不采取任何操作」；如果希望连桌面都完全不参与，
+  可以把 `browser.headless` 设为 `true`——最稳，但就看不到提交过程了。
+
 - **控制台窗口不会弹出**。计划任务用 `conhost.exe --headless` 启动 —— 子进程照常运行，但**不分配可见窗口**。
 
   > 提交额度时弹出的 **Edge 窗口是故意的**：那是真实提交过程，留着你能亲眼看到填了什么、点了什么。
