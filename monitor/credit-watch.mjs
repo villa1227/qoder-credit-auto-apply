@@ -1,26 +1,47 @@
 /**
- * Passive credit watcher for Qoder Desktop.
+ * Passive credit watcher for Qoder Desktop.  (monitoring layer - school agnostic)
+ *
+ * This file knows nothing about any university portal. It reads the quota that
+ * Qoder Desktop itself writes into its local log and, when the balance drops
+ * below the threshold, hands over to the submission script named in
+ * config.paths.applyScript (the "apply layer", a separate folder).
  *
  * Detection source: Qoder Desktop itself refreshes GET /sash/api/v2/me/usage and writes the
  * full normalized quota JSON into its local log as a "用量响应摘要" line. We only read that
  * file locally - no polling of the quota API, no LLM turn, no credit cost.
  *
  * Usage:
- *   node credit-watch.mjs --once            # single evaluation, prints the verdict
- *   node credit-watch.mjs --watch           # long-running passive watcher
- *   node credit-watch.mjs --status          # print state.json
- *   node credit-watch.mjs --reset           # reset the state machine to idle
- *   node credit-watch.mjs --mark <stage> [--application-id x] [--note x]
- *   node credit-watch.mjs --once --dry-run  # never dispatch, only report
+ *   node monitor/credit-watch.mjs --tick           # scheduled entry point (see below)
+ *   node monitor/credit-watch.mjs --once           # single evaluation, prints the verdict
+ *   node monitor/credit-watch.mjs --watch          # long-running passive watcher
+ *   node monitor/credit-watch.mjs --status         # print state.json
+ *   node monitor/credit-watch.mjs --reset          # reset the state machine to idle
+ *   node monitor/credit-watch.mjs --mark <stage> [--application-id x] [--note x]
+ *   node monitor/credit-watch.mjs --once --dry-run # never dispatch, only report
+ *
+ * --tick is what the scheduled task runs every couple of minutes: it first
+ * checks whether Qoder Desktop is actually running and only then looks at the
+ * log. While Qoder is closed nothing is monitored and no work is done.
  */
 import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, openSync, readSync, closeSync, unlinkSync, renameSync, appendFileSync, utimesSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { join, dirname, resolve, isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { execFileSync } from 'node:child_process';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const CONFIG_FILE = join(HERE, 'config.json');
-const STATE_FILE = join(HERE, 'state.json');
+// The application root is the parent of this folder (monitor/ and apply/ are
+// siblings); the config and all runtime files live there.
+const APP_ROOT = dirname(HERE);
+const CONFIG_FILE = join(APP_ROOT, 'config.json');
+const STATE_FILE = join(APP_ROOT, 'state.json');
 const MARKER = '用量响应摘要';
+
+/** Resolve a config path against the application root. */
+function appPath(value, fallback) {
+  const target = value || fallback;
+  if (!target) return null;
+  return isAbsolute(target) ? target : resolve(APP_ROOT, target);
+}
 
 function loadConfig() {
   const config = JSON.parse(readFileSync(CONFIG_FILE, 'utf8'));
@@ -33,20 +54,69 @@ function loadConfig() {
   config.threshold = Number(config.threshold ?? 150);
   config.pollIntervalMs = Number(config.pollIntervalMs ?? 60000);
   config.maxSnapshotAgeHours = Number(config.maxSnapshotAgeHours ?? 6);
-  config.applyScript = process.env.QODER_CREDIT_APPLY_SCRIPT || join(HERE, 'apply-pku.mjs');
+  // The apply layer is a separate, replaceable program. The monitoring layer
+  // only knows its path and hands over the remaining credits through the
+  // REMAINING_CREDITS environment variable.
+  config.applyScript = process.env.QODER_CREDIT_APPLY_SCRIPT
+    || appPath(config.paths?.applyScript, join('apply', 'apply-pku.mjs'));
   config.stateFile = process.env.QODER_CREDIT_STATE_FILE || STATE_FILE;
   config.lockFile = process.env.QODER_CREDIT_LOCK_FILE || DEFAULT_LOCK_FILE;
-  config.heartbeatFile = process.env.QODER_CREDIT_HEARTBEAT_FILE || join(HERE, 'watch.heartbeat');
-  config.watchLogFile = process.env.QODER_CREDIT_WATCH_LOG_FILE || join(HERE, 'watch.log');
-  config.watchLockFile = process.env.QODER_CREDIT_WATCH_LOCK_FILE || join(HERE, 'watch.lock');
+  config.heartbeatFile = process.env.QODER_CREDIT_HEARTBEAT_FILE || join(APP_ROOT, 'watch.heartbeat');
+  config.watchLogFile = process.env.QODER_CREDIT_WATCH_LOG_FILE || join(APP_ROOT, 'watch.log');
+  config.watchLockFile = process.env.QODER_CREDIT_WATCH_LOCK_FILE || join(APP_ROOT, 'watch.lock');
   // Log files are bounded: the watcher appends one line per minute forever, so
   // they are trimmed to their tail once they pass the cap.
   config.maxLogBytes = Number(process.env.QODER_CREDIT_MAX_LOG_BYTES ?? config.maxLogBytes ?? 1024 * 1024);
   config.keepLogBytes = Number(process.env.QODER_CREDIT_KEEP_LOG_BYTES ?? config.keepLogBytes ?? 256 * 1024);
+  // Which process means "Qoder Desktop is open". An empty list disables the guard.
+  config.guard = config.guard ?? {};
+  config.guard.enabled = process.env.QODER_CREDIT_GUARD
+    ? process.env.QODER_CREDIT_GUARD !== '0'
+    : config.guard.enabled !== false;
+  config.guard.processNames = process.env.QODER_CREDIT_GUARD_PROCESSES
+    ? process.env.QODER_CREDIT_GUARD_PROCESSES.split(',').map((s) => s.trim()).filter(Boolean)
+    : (config.guard.processNames ?? ['Qoder CN.exe', 'Qoder.exe']);
   return config;
 }
 
-/** True when a long-running watcher refreshed its heartbeat recently. */
+/**
+ * Is Qoder Desktop running right now?
+ *
+ * Only the local process list is consulted; nothing is polled over the network.
+ * If tasklist cannot answer, the check falls back to "the Qoder log was written
+ * recently", which is a good enough proxy: that log only grows while Qoder runs.
+ */
+function qoderRunning(config) {
+  const guard = config.guard ?? {};
+  if (!guard.enabled) return true;
+  const names = guard.processNames ?? [];
+  if (!names.length) return true;
+  let listed = false;
+  for (const name of names) {
+    let out = '';
+    try {
+      out = execFileSync('tasklist.exe', ['/FI', `IMAGENAME eq ${name}`, '/NH', '/FO', 'CSV'], {
+        encoding: 'utf8',
+        windowsHide: true,
+        timeout: 8000,
+      });
+    } catch {
+      continue;
+    }
+    listed = true;
+    for (const line of out.split(/\r?\n/)) {
+      const match = /^"([^"]+)"/.exec(line.trim());
+      if (match && match[1].toLowerCase() === name.toLowerCase()) return true;
+    }
+  }
+  if (listed) return false;
+  const entry = findLatestLogFile(config);
+  if (!entry) return false;
+  const maxAgeMs = Number(guard.logActivityFallbackMinutes ?? 10) * 60000;
+  return Date.now() - entry.mtime < maxAgeMs;
+}
+
+/** True when a recent run of the watcher refreshed its heartbeat. */
 function watcherAlive(config, maxAgeMs = 180000) {
   try {
     return Date.now() - statSync(config.heartbeatFile).mtimeMs < maxAgeMs;
@@ -286,7 +356,7 @@ function computeEffectiveRemaining(qoderUsage) {
 }
 
 
-const DEFAULT_LOCK_FILE = join(HERE, 'apply.lock');
+const DEFAULT_LOCK_FILE = join(APP_ROOT, 'apply.lock');
 
 /**
  * Only one submission may be in flight. The lock is a file created exclusively;
@@ -390,7 +460,7 @@ async function dispatchApply(config, state, snapshotInfo) {
   // No Agent turn, no Qoder credits - the application still goes out when the
   // credit balance is already exhausted.
   const { spawn } = await import('node:child_process');
-  const logFile = join(HERE, 'apply.log');
+  const logFile = join(APP_ROOT, 'apply.log');
   // apply.log only grows when an application is actually submitted, but keep it
   // bounded all the same.
   rotateLogFile(logFile, logLimits.maxBytes, logLimits.keepBytes);
@@ -563,6 +633,22 @@ function parseArgs(argv) {
   return args;
 }
 
+/**
+ * Record that the monitor ran. The fallback task uses this to tell "the
+ * scheduled monitor is alive" from "it died and nobody noticed".
+ */
+function writeHeartbeat(config, extra = {}) {
+  try {
+    writeFileSync(
+      config.heartbeatFile,
+      JSON.stringify({ at: new Date().toISOString(), pid: process.pid, ...extra }),
+      'utf8',
+    );
+  } catch {
+    /* ignore */
+  }
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   const config = loadConfig();
@@ -606,6 +692,22 @@ async function main() {
     return;
   }
 
+  if (args.tick) {
+    // Scheduled entry point. Everything the monitor does is gated on Qoder
+    // Desktop actually running: while Qoder is closed there is no fresh quota
+    // in the log, and the point of the task is to never monitor on its own.
+    setLogFileSink(config.watchLogFile);
+    const running = qoderRunning(config);
+    writeHeartbeat(config, { qoderRunning: running });
+    if (!running) {
+      log('qoder is not running - nothing to monitor');
+      return;
+    }
+    const result = await evaluate(config, {});
+    log(`tick finished: effective=${result.effective ?? 'n/a'} stage=${result.stage ?? 'n/a'}`);
+    return;
+  }
+
   if (args.watch) {
     setLogFileSink(config.watchLogFile);
     if (!acquireWatcherLock(config.watchLockFile)) {
@@ -621,17 +723,24 @@ async function main() {
     };
     process.on('exit', shutdown);
     log('watcher started, interval', config.pollIntervalMs, 'ms');
+    let idleTicks = 0;
     const tick = async () => {
       try {
-        await evaluate(config, {});
+        if (qoderRunning(config)) {
+          idleTicks = 0;
+          await evaluate(config, {});
+        } else {
+          idleTicks += 1;
+          log('qoder is not running - skipping evaluation');
+          if (idleTicks >= 5) {
+            log('qoder stayed closed - stopping the resident watcher');
+            process.exit(0);
+          }
+        }
       } catch (error) {
         log('evaluation error:', error.message || error);
       }
-      try {
-        writeFileSync(config.heartbeatFile, new Date().toISOString(), 'utf8');
-      } catch {
-        /* ignore */
-      }
+      writeHeartbeat(config, { qoderRunning: idleTicks === 0 });
       refreshWatcherLock(config.watchLockFile);
     };
     await tick();
@@ -641,9 +750,15 @@ async function main() {
 
   // Fallback check (scheduled task): if the resident watcher is alive, do nothing
   // so the two processes never fight over state.json.
-  if (args.fallback && watcherAlive(config)) {
-    log('watcher alive - fallback check skipped');
-    return;
+  if (args.fallback) {
+    if (watcherAlive(config, Number(config.heartbeatAliveMs ?? 300000))) {
+      log('watcher alive - fallback check skipped');
+      return;
+    }
+    if (!qoderRunning(config)) {
+      log('qoder is not running - fallback check skipped');
+      return;
+    }
   }
 
   const result = await evaluate(config, { dryRun: Boolean(args['dry-run']) });

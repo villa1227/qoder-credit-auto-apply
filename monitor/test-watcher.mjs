@@ -9,10 +9,12 @@ import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
+const MONITOR = join(HERE, 'credit-watch.mjs');
 const TMP = join(HERE, 'test-tmp');
 const LOG_DIR = join(TMP, 'logs', '20261127-000000.000-test');
 const STATE = join(TMP, 'state.json');
 const LOCK = join(TMP, 'apply.lock');
+const HEARTBEAT = join(TMP, 'watch.heartbeat');
 const STUB = join(TMP, 'stub-apply.mjs');
 
 rmSync(TMP, { recursive: true, force: true });
@@ -61,7 +63,7 @@ function writeSnapshot(remaining, expiresAt) {
 function runWatcher(extraArgs = [], extraEnv = {}) {
   const result = spawnSync(
     process.execPath,
-    [join(HERE, 'credit-watch.mjs'), '--once', ...extraArgs],
+    [MONITOR, '--once', ...extraArgs],
     {
       encoding: 'utf8',
       env: {
@@ -69,7 +71,10 @@ function runWatcher(extraArgs = [], extraEnv = {}) {
         QODER_CREDIT_LOG_DIR: join(TMP, 'logs'),
         QODER_CREDIT_STATE_FILE: STATE,
         QODER_CREDIT_LOCK_FILE: LOCK,
+        QODER_CREDIT_HEARTBEAT_FILE: HEARTBEAT,
         QODER_CREDIT_APPLY_SCRIPT: STUB,
+        // The tests must not depend on Qoder Desktop actually running.
+        QODER_CREDIT_GUARD: '0',
         ...extraEnv,
       },
     },
@@ -80,9 +85,34 @@ function runWatcher(extraArgs = [], extraEnv = {}) {
   return result;
 }
 
+/** Run the scheduled entry point (--tick) with a specific guard setting. */
+function runTick(env = {}) {
+  const result = spawnSync(process.execPath, [MONITOR, '--tick'], {
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      QODER_CREDIT_LOG_DIR: join(TMP, 'logs'),
+      QODER_CREDIT_STATE_FILE: STATE,
+      QODER_CREDIT_LOCK_FILE: LOCK,
+      QODER_CREDIT_HEARTBEAT_FILE: HEARTBEAT,
+      QODER_CREDIT_APPLY_SCRIPT: STUB,
+      ...env,
+    },
+  });
+  if (result.status !== 0) {
+    console.log('--- tick stdout ---\n' + result.stdout + '\n--- tick stderr ---\n' + result.stderr);
+  }
+  return result;
+}
+
 function resetState() {
-  spawnSync(process.execPath, [join(HERE, 'credit-watch.mjs'), '--reset'], {
-    env: { ...process.env, QODER_CREDIT_STATE_FILE: STATE, QODER_CREDIT_LOCK_FILE: LOCK },
+  spawnSync(process.execPath, [MONITOR, '--reset'], {
+    env: {
+      ...process.env,
+      QODER_CREDIT_STATE_FILE: STATE,
+      QODER_CREDIT_LOCK_FILE: LOCK,
+      QODER_CREDIT_HEARTBEAT_FILE: HEARTBEAT,
+    },
     encoding: 'utf8',
   });
 }
@@ -167,6 +197,30 @@ runWatcher(['--dry-run']);
 check('dry run does not dispatch', state().stage === 'triggered', JSON.stringify(state()));
 check('dry run records no dispatch', !state().dispatchedAt, JSON.stringify(state()));
 check('dry run leaves no lock', !existsSync(LOCK));
+
+// 7) the scheduled tick only monitors while Qoder Desktop is running
+resetState();
+writeSnapshot(100, 1798214400000);
+const tickClosed = runTick({
+  QODER_CREDIT_GUARD: '1',
+  QODER_CREDIT_GUARD_PROCESSES: 'this-process-does-not-exist-9d1f.exe',
+});
+check('tick with qoder closed does not trigger', state().stage === 'idle', JSON.stringify(state()));
+check('tick with qoder closed does not dispatch', !state().dispatchedAt, JSON.stringify(state()));
+check('tick with qoder closed exits cleanly', tickClosed.status === 0, String(tickClosed.status));
+const beatClosed = existsSync(HEARTBEAT) ? JSON.parse(readFileSync(HEARTBEAT, 'utf8')) : null;
+check('heartbeat records qoder closed', beatClosed && beatClosed.qoderRunning === false, JSON.stringify(beatClosed));
+
+// 8) with the guard open (qoder running) the very same tick does trigger
+resetState();
+writeSnapshot(100, 1798214400000);
+const tickOpen = runTick({ QODER_CREDIT_GUARD: '1', QODER_CREDIT_GUARD_PROCESSES: 'explorer.exe' });
+check('tick with qoder running triggers', ['triggered', 'dispatched'].includes(state().stage), JSON.stringify(state()));
+check('tick with qoder running dispatches', Boolean(state().dispatchedAt), JSON.stringify(state()));
+const beatOpen = existsSync(HEARTBEAT) ? JSON.parse(readFileSync(HEARTBEAT, 'utf8')) : null;
+check('heartbeat records qoder running', beatOpen && beatOpen.qoderRunning === true, JSON.stringify(beatOpen));
+await waitForStage('submitted');
+check('tick dispatch reaches submitted', state().stage === 'submitted', JSON.stringify(state()));
 
 if (!process.env.KEEP_TMP) rmSync(TMP, { recursive: true, force: true });
 console.log(failures.length === 0 ? '\nALL TESTS PASSED' : `\nFAILED: ${failures.join(', ')}`);

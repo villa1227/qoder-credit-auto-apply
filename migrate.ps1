@@ -44,7 +44,7 @@ if (Test-Path -LiteralPath $Target) {
     throw "Target already exists and is not empty: $Target (use -Force to overwrite)"
   }
   if ($existing) {
-    Write-Output "Target exists - overwriting (existing files are replaced, the .git folder is left alone)."
+    Write-Output "Target exists - overwriting (existing files are replaced)."
   } else {
     Write-Output "Target exists and is empty - using it."
   }
@@ -67,7 +67,7 @@ Start-Sleep -Seconds 2
 # would also make the copied watch.lock point at a still-running pid, which
 # makes the new instance think it is a duplicate and quit.
 $leftovers = Get-CimInstance Win32_Process -Filter "name='node.exe'" |
-  Where-Object { $_.CommandLine -like "*$source\credit-watch.mjs*" }
+  Where-Object { $_.CommandLine -like "*$source\monitor\credit-watch.mjs*" }
 if ($leftovers) {
   Write-Output "stopping $($leftovers.Count) leftover watcher process(es) from $source"
   $leftovers | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
@@ -87,8 +87,9 @@ if ($profileDirs) {
 # 2. Copy the folder. /MOVE would delete the source, which is not wanted.
 # Runtime files are excluded: watch.lock carries the pid of the instance that
 # just got killed, and copying it would make the new instance refuse to start.
+# The .git folder travels along, so the install stays a git checkout.
 $null = robocopy $source $Target /E /R:2 /W:1 /NFL /NDL /NJH /NJS /NP `
-  /XD '.git' /XF 'watch.lock' 'watch.heartbeat' 'check.lock'
+  /XF 'watch.lock' 'watch.heartbeat' 'check.lock' 'apply.lock'
 if ($LASTEXITCODE -ge 8) { throw "robocopy failed with exit code $LASTEXITCODE" }
 Write-Output 'copy done'
 

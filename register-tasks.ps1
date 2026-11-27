@@ -9,11 +9,14 @@
 #
 #   2. No console window may appear. A console app started by Task Scheduler
 #      in the interactive session opens a terminal window that stays on screen
-#      for the whole run (the resident watcher runs forever). conhost.exe
-#      --headless gives the child a console without a visible window, which
-#      keeps the watcher running invisibly. The Edge window that appears during
-#      an actual quota submission is a separate GUI app and still shows, which
-#      is intended - you can see the submission happen.
+#      for the whole run. conhost.exe --headless gives the child a console
+#      without a visible window. The Edge window that appears during an actual
+#      quota submission is a separate GUI app and still shows, which is
+#      intended - you can see the submission happen.
+#
+# The monitor never runs on its own: the scheduled task is a short "tick" that
+# first asks whether Qoder Desktop is running and only then looks at the
+# quota in Qoder's local log. Qoder closed -> the tick returns immediately.
 #
 # Note on paths: node itself handles non-ASCII script paths fine when Task
 # Scheduler calls it directly (verified). Two earlier problems were caused by
@@ -25,6 +28,12 @@
 $ErrorActionPreference = 'Stop'
 
 $base = $PSScriptRoot
+$monitor = Join-Path $base 'monitor\credit-watch.mjs'
+if (-not (Test-Path $monitor)) { throw "monitor script not found: $monitor" }
+
+# How often the scheduled tick wakes up. Two minutes is plenty: the balance
+# only changes when Qoder refreshes its quota, and the tick costs nothing.
+$tickMinutes = 2
 
 # Resolve node from the machine rather than hardcoding a path.
 $node = (Get-Command node.exe -ErrorAction SilentlyContinue).Source
@@ -44,18 +53,10 @@ if (-not (Test-Path $conhost)) { throw "conhost.exe not found at $conhost" }
 
 Write-Output "base   = $base"
 Write-Output "node   = $node"
+Write-Output "tick   = every $tickMinutes minute(s)"
 
-# Stop any running instance before dropping the tasks: the resident watcher
-# holds watch.lock, and an orphaned copy would block the new one from starting.
-# Stop-ScheduledTask only kills the task's own process (conhost), so the node
-# process it spawned has to be stopped explicitly.
-$leftovers = Get-CimInstance Win32_Process -Filter "name='node.exe'" |
-  Where-Object { $_.CommandLine -like "*$base\credit-watch.mjs*" }
-if ($leftovers) {
-  Write-Output "stopping $($leftovers.Count) leftover watcher process(es)"
-  $leftovers | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-  Start-Sleep -Seconds 2
-}
+# Stop any running instance before dropping the tasks: a leftover tick would
+# keep writing into the old state file.
 foreach ($name in 'QoderCreditWatch','QoderCreditCheck') {
   Stop-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
 }
@@ -63,39 +64,53 @@ foreach ($name in 'QoderCreditWatch','QoderCreditCheck') {
   Unregister-ScheduledTask -TaskName $name -Confirm:$false -ErrorAction SilentlyContinue
 }
 
-# A lock left behind by a killed instance would make the new watcher quit with
-# "another watcher instance is already running".
-foreach ($stale in 'watch.lock','watch.heartbeat') {
+# Stop-ScheduledTask only kills the task's own process (conhost), so the node
+# process it spawned has to be stopped explicitly.
+$leftovers = Get-CimInstance Win32_Process -Filter "name='node.exe'" |
+  Where-Object { $_.CommandLine -like "*$base\monitor\credit-watch.mjs*" }
+if ($leftovers) {
+  Write-Output "stopping $($leftovers.Count) leftover watcher process(es)"
+  $leftovers | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+  Start-Sleep -Seconds 2
+}
+
+# A lock left behind by a killed instance would make a new run think it is a
+# duplicate, and a stale heartbeat would hide a broken task.
+foreach ($stale in 'watch.lock','watch.heartbeat','apply.lock') {
   $path = Join-Path $base $stale
   if (Test-Path $path) { Remove-Item $path -Force -ErrorAction SilentlyContinue }
 }
 
 $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
 
-# Resident watcher. It writes watch.log itself, so stdout is irrelevant.
+# The scheduled tick. It writes watch.log itself, so stdout is irrelevant.
 $watch = New-ScheduledTaskAction `
   -Execute $conhost `
-  -Argument "--headless `"$node`" `"$base\credit-watch.mjs`" --watch" `
+  -Argument "--headless `"$node`" `"$monitor`" --tick" `
   -WorkingDirectory $env:USERPROFILE
-# The AtLogOn trigger must name the user explicitly; a trigger without -User
-# applies to every user and registration then fails with 0x80070005.
-$watchTrigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
-$watchSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
-Register-ScheduledTask -TaskName 'QoderCreditWatch' -Action $watch -Trigger $watchTrigger -Settings $watchSettings -Principal $principal -Description 'Passive Qoder credit watcher (reads local Qoder log, submits PKU quota application when credits run low)' -Force -ErrorAction Stop | Out-Null
+# A pure time trigger: the tick must not depend on a logon event, it simply
+# runs every few minutes and checks whether Qoder Desktop is open.
+$watchTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes $tickMinutes)
+$watchSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::FromMinutes(10)) -MultipleInstances IgnoreNew
+Register-ScheduledTask -TaskName 'QoderCreditWatch' -Action $watch -Trigger $watchTrigger -Settings $watchSettings -Principal $principal -Description 'Passive Qoder credit monitor: ticks every few minutes and only looks at the quota while Qoder Desktop is running' -Force -ErrorAction Stop | Out-Null
 
-# Low-frequency fallback check: no-op while the resident watcher is alive.
+# Low-frequency fallback check: no-op while the scheduled tick is alive.
 $check = New-ScheduledTaskAction `
   -Execute $conhost `
-  -Argument "--headless `"$node`" `"$base\credit-watch.mjs`" --once --fallback --log-file `"$base\check.log`"" `
+  -Argument "--headless `"$node`" `"$monitor`" --once --fallback --log-file `"$base\check.log`"" `
   -WorkingDirectory $env:USERPROFILE
 $checkTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Hours 6)
-$checkSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::FromMinutes(10)) -StartWhenAvailable
+$checkSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::FromMinutes(10)) -StartWhenAvailable -MultipleInstances IgnoreNew
 Register-ScheduledTask -TaskName 'QoderCreditCheck' -Action $check -Trigger $checkTrigger -Settings $checkSettings -Principal $principal -Description 'Low-frequency fallback credit check (every 6h, no-op unless credits are low)' -Force -ErrorAction Stop | Out-Null
 
 Get-ScheduledTask -TaskName 'QoderCreditWatch','QoderCreditCheck' | Select-Object TaskName, State | Format-Table -AutoSize
 
-# Start the resident watcher right away so that re-running this script after a
-# move leaves the setup working without a sign-out.
+# Run one tick right away so the setup can be verified without waiting.
 Start-ScheduledTask -TaskName 'QoderCreditWatch'
-Start-Sleep -Seconds 3
+Start-Sleep -Seconds 5
 Get-ScheduledTask -TaskName 'QoderCreditWatch' | Select-Object TaskName, State | Format-Table -AutoSize
+$log = Join-Path $base 'watch.log'
+if (Test-Path $log) {
+  Write-Output '--- watch.log ---'
+  Get-Content $log -Tail 5
+}

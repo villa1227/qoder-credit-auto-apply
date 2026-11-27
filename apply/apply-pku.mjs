@@ -1,6 +1,12 @@
 /**
  * Submit the Qoder credit quota application on the PKU service portal (办事大厅).
  *
+ * This is the "apply layer": the only part of the project that knows a concrete
+ * portal. The monitoring layer (monitor/) is school agnostic and calls this
+ * script when the credit balance is low. Anyone who wants a different portal
+ * replaces this folder, or points config.paths.applyScript at their own script -
+ * see apply/README.md.
+ *
  * Flow (verified against the live site on 2026-11-27):
  *   1. open https://wsyy.pku.edu.cn/fe/site/matterDetails?app_id=575
  *   2. click "立即申请" -> the same tab navigates to
@@ -16,19 +22,29 @@
  * both are explicitly avoided when picking the reason field and the submit button.
  */
 import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, readdirSync, statSync } from 'node:fs';
-import { join, dirname, resolve } from 'node:path';
+import { join, dirname, resolve, isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { Browser, Page, launchBrowser, isPortAlive, sleep } from './browser-driver.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const CONFIG_FILE = join(HERE, 'config.json');
-const ARTIFACT_DIR = join(HERE, 'artifacts');
+// The application root is the parent of this folder; the config, the runtime
+// files and the artifacts directory all live there.
+const APP_ROOT = dirname(HERE);
+const CONFIG_FILE = join(APP_ROOT, 'config.json');
+const ARTIFACT_DIR = join(APP_ROOT, 'artifacts');
 
 const log = (...args) => console.log(`[${new Date().toISOString()}]`, ...args);
 
 function loadConfig() {
   return JSON.parse(readFileSync(CONFIG_FILE, 'utf8'));
+}
+
+/** Resolve a config path against the application root. */
+function appPath(value, fallback) {
+  const target = value || fallback;
+  if (!target) return null;
+  return isAbsolute(target) ? target : resolve(APP_ROOT, target);
 }
 
 /**
@@ -71,17 +87,23 @@ function pruneArtifacts(dir, maxBytes = 20 * 1024 * 1024) {
   }
 }
 
+/**
+ * Report the outcome back to the monitoring layer, so the state machine knows
+ * whether the application went through. The monitoring script is looked up in
+ * the config (config.paths.monitorScript) - the apply layer never hardcodes it.
+ */
 function markState(stage, { note, applicationId } = {}) {
   const args = ['--mark', stage];
   if (note) args.push('--note', note);
   if (applicationId) args.push('--application-id', applicationId);
-  spawnSync(process.execPath, [join(HERE, 'credit-watch.mjs'), ...args], { stdio: 'inherit' });
+  const monitor = appPath(loadConfig().paths?.monitorScript, join('monitor', 'credit-watch.mjs'));
+  spawnSync(process.execPath, [monitor, ...args], { stdio: 'inherit' });
 }
 
 /** Ensure a browser with our dedicated profile is running and connected. */
 async function ensureBrowser(config) {
   const port = config.browser.port ?? 9333;
-  const profileDir = resolve(HERE, config.browser.profileDir ?? 'browser-profile');
+  const profileDir = appPath(config.browser.profileDir, 'browser-profile');
   if (!(await isPortAlive(port))) {
     log('launching browser...');
     await launchBrowser({ port, profileDir, headless: Boolean(config.browser.headless) });
@@ -147,6 +169,7 @@ async function clickByText(page, text, { timeoutMs = 0 } = {}) {
  */
 async function openForm(browser, page, config) {
   const applyText = config.browser.applyButtonText ?? '立即申请';
+  const formPattern = config.application?.formUrlPattern ?? 'matterApplication';
   const deadline = Date.now() + 90000;
   let attempt = 0;
   while (Date.now() < deadline) {
@@ -160,8 +183,8 @@ async function openForm(browser, page, config) {
         await sleep(800);
         const tabs = await browser.listPages();
         const httpTabs = tabs.filter((t) => /^https?:/.test(t.url || ''));
-        const formTab = httpTabs.find((t) => !tabsBefore.has(t.targetId) && (t.url || '').includes('matterApplication'))
-          ?? httpTabs.find((t) => (t.url || '').includes('matterApplication'));
+        const formTab = httpTabs.find((t) => !tabsBefore.has(t.targetId) && (t.url || '').includes(formPattern))
+          ?? httpTabs.find((t) => (t.url || '').includes(formPattern));
         if (formTab) {
           const attached = await attachWithRetry(browser, formTab.targetId);
           await sleep(1500);
@@ -377,12 +400,15 @@ async function main() {
   let exitCode = 0;
   try {
     const url = config.application.url;
+    const portalHosts = config.application?.portalHosts ?? ['wsyy.pku.edu.cn', 'iaaa.pku.edu.cn'];
+    const loginPattern = config.application?.loginUrlPattern ?? 'iaaa.pku.edu.cn';
     // Prefer a tab that shows the matter details page; otherwise reuse any portal
     // tab (that is the window the user is logging in on); otherwise open a new one.
     let page = null;
     const openTabs = await browser.listPages();
-    const detailsTab = openTabs.find((t) => (t.url || '').includes('matterDetails'));
-    const anyPortalTab = openTabs.find((t) => /wsyy\.pku\.edu\.cn|iaaa\.pku\.edu\.cn/.test(t.url || ''));
+    const detailsPattern = config.application?.detailsUrlPattern ?? 'matterDetails';
+    const detailsTab = openTabs.find((t) => (t.url || '').includes(detailsPattern));
+    const anyPortalTab = openTabs.find((t) => portalHosts.some((host) => (t.url || '').includes(host)));
     if (detailsTab) {
       page = await browser.attach(detailsTab.targetId);
       log('reusing tab at', detailsTab.url.slice(0, 90));
@@ -397,16 +423,16 @@ async function main() {
 
     // 1. login handling
     let currentUrl = (await page.url()) || '';
-    if (currentUrl.includes('iaaa.pku.edu.cn')) {
+    if (currentUrl.includes(loginPattern)) {
       const waitMinutes = config.browser.waitLoginMinutes ?? 20;
       log('login required - complete it in the browser window; waiting up to', waitMinutes, 'min');
       const deadline = Date.now() + waitMinutes * 60000;
       while (Date.now() < deadline) {
         await sleep(3000);
         currentUrl = (await page.url().catch(() => currentUrl)) || currentUrl;
-        if (!currentUrl.includes('iaaa.pku.edu.cn')) break;
+        if (!currentUrl.includes(loginPattern)) break;
       }
-      if (currentUrl.includes('iaaa.pku.edu.cn')) {
+      if (currentUrl.includes(loginPattern)) {
         await page.screenshot(join(ARTIFACT_DIR, 'login-timeout.png'));
         throw new Error('LOGIN_TIMEOUT');
       }
@@ -508,7 +534,7 @@ async function main() {
     browser.close();
     if (!dryRun) {
       try {
-        unlinkSync(join(HERE, 'apply.lock'));
+        unlinkSync(join(APP_ROOT, 'apply.lock'));
       } catch {
         /* ignore */
       }
