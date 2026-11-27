@@ -18,7 +18,8 @@
 | `config.json` | 阈值、轮询间隔、按钮文案、日志上限等全部配置 |
 | `state.json` | 运行时状态机（`idle → triggered → dispatched → submitted \| failed`），**不入库** |
 | `test-watcher.mjs` | 离线测试（19 项断言），不需要浏览器也不需要额度接口 |
-| `register-tasks.ps1` | 注册/更新两个 Windows 计划任务 |
+| `register-tasks.ps1` | 注册/更新两个 Windows 计划任务（路径自定位，可整目录搬迁） |
+| `migrate.ps1` | 搬迁助手：复制到新目录并重新注册任务，一条命令搞定 |
 | `watch.cmd` / `check.cmd` | 手动兜底启动脚本 |
 | `browser-profile/` | Edge 专用 profile（保存北大登录态），**含登录 cookie，绝不入库** |
 | `artifacts/` | 提交前后的截图与页面结构 dump，**不入库** |
@@ -127,7 +128,28 @@ node apply-pku.mjs --dry-run
 
 ## 已知限制
 
-- **应用目录必须是纯 ASCII 路径**。Windows 计划任务通过 `cmd.exe` 启动批处理时无法解析中文目录名，任务会**静默失败**（退出码 1；工作目录含中文则报 `0x8007010B`）。若要迁移目录，需同步修改 `register-tasks.ps1` 里的 `$base` 并重新注册。
+- **应用目录可以是任意路径，含中文也没问题**（实测：计划任务直接调用 node 时中文脚本路径正常，`conhost --headless` 同样正常）。搬迁用一条命令：
+
+  ```powershell
+  powershell -NoProfile -ExecutionPolicy Bypass -File .\migrate.ps1 -Target 'D:\apps\credit-apply'
+  ```
+
+  它会停任务 → 复制目录（`browser-profile/` 连同北大登录态一起带走，不用重新登录）→ 在新位置重新注册任务 → 启动监视器并打印验证结果。**旧目录不会自动删除**，确认新位置正常后自己删。
+
+  也可以手动搬：把整个文件夹移到新位置，在新位置运行 `register-tasks.ps1` 即可（脚本所有路径都从自身位置推导，不含硬编码路径）。
+
+  历史上踩过的坑与现在的规避方式：
+
+  | 坑 | 现象 | 现在的做法 |
+  | --- | --- | --- |
+  | `.cmd` 作为任务动作 | 含中文目录时 `cmd.exe /c` 静默失败，退出码 1 | 任务动作直接调 `node.exe`，不用批处理包装 |
+  | WorkingDirectory 含中文 | 报 `0x8007010B`（目录无效） | 固定用 `$env:USERPROFILE`，脚本路径全部自解析 |
+  | `Register-ScheduledTask -Force` 覆盖已有任务 | 报 `0x80070005`（拒绝访问） | 先 `Unregister-ScheduledTask` 再注册 |
+
+- **控制台窗口不会弹出**。常驻监视器由计划任务启动，若直接跑 `node.exe` 会常驻一个终端窗口；现在任务动作统一用 `conhost.exe --headless` 启动 —— 子进程照常运行，但**不分配可见窗口**。
+
+  > 提交额度时弹出的 **Edge 窗口是故意的**：那是真实提交过程，留着你能亲眼看到填了什么、点了什么。
+
 - **门户改版**会导致定位失败：按钮/字段改名时脚本会把页面结构 dump 到 `artifacts/` 并标记 `failed`，不会乱点。
 - **提交结果不确定**时仍按 `submitted` 处理（宁可少申请一次，也不重复申请），并在 `state.json` 备注里提示人工核实。
 - Edge 窗口被关闭或机器重启都没关系：脚本每次都会重新拉起 Edge，登录态保存在专用 profile 里。
