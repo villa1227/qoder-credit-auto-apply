@@ -65,9 +65,10 @@ Start-Sleep -Seconds 2
 # Stop-ScheduledTask only kills the task's own process (conhost), not the node
 # process it spawned. A leftover watcher would keep the old install alive and
 # would also make the copied watch.lock point at a still-running pid, which
-# makes the new instance think it is a duplicate and quit.
+# makes the new instance think it is a duplicate and quit. The match is loose on
+# purpose: leftovers from an older layout point at a script in the root folder.
 $leftovers = Get-CimInstance Win32_Process -Filter "name='node.exe'" |
-  Where-Object { $_.CommandLine -like "*$source\monitor\credit-watch.mjs*" }
+  Where-Object { $_.CommandLine -like "*$source*credit-watch.mjs*" }
 if ($leftovers) {
   Write-Output "stopping $($leftovers.Count) leftover watcher process(es) from $source"
   $leftovers | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }

@@ -65,9 +65,11 @@ foreach ($name in 'QoderCreditWatch','QoderCreditCheck') {
 }
 
 # Stop-ScheduledTask only kills the task's own process (conhost), so the node
-# process it spawned has to be stopped explicitly.
+# process it spawned has to be stopped explicitly. The match is loose on
+# purpose: an install from an older layout put the script straight into the
+# root folder, and those leftovers must die as well.
 $leftovers = Get-CimInstance Win32_Process -Filter "name='node.exe'" |
-  Where-Object { $_.CommandLine -like "*$base\monitor\credit-watch.mjs*" }
+  Where-Object { $_.CommandLine -like "*$base*credit-watch.mjs*" }
 if ($leftovers) {
   Write-Output "stopping $($leftovers.Count) leftover watcher process(es)"
   $leftovers | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
