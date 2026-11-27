@@ -34,7 +34,8 @@ node apply/apply-pku.mjs
    node monitor/credit-watch.mjs --mark failed    --note "FORM_NOT_OPEN"
    ```
 
-   `submitted` 是终态：同一个额度周期内不会再触发第二次申请。
+   `submitted` 只表示"这一笔已经提交、先别重复提交"：额度涨回阈值以上、或上限 `cap` 变大
+   （说明新额度到账）之后，监控层会重新武装并允许再申请，没有"一个周期只能申请一次"的限制。
    `failed` 会在 10 分钟后重试。
 3. **退出码**：`0` 成功，`1` 失败，`3` 提交结果不确定（已按 `submitted` 处理，避免重复申请）。
 4. **锁**：提交期间 `apply.lock`（在应用根目录）由监控层持有，脚本结束后删除它。

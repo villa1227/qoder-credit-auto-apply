@@ -144,10 +144,18 @@ node apply/apply-pku.mjs --dry-run
 | `idle` | 额度充足，继续观察 |
 | `triggered` | 已跌破阈值，等待派发 |
 | `dispatched` | 提交脚本已启动 |
-| `submitted` | 本额度周期已提交过，**不会重复申请** |
+| `submitted` | 上一笔申请已提交，等额度到账 |
 | `failed` | 提交失败，按重试规则 10 分钟后再试 |
 
-`cycleKey` 取服务端 `expiresAt`：**额度周期一变，状态机自动复位**，新周期可以再申请一次。
+**没有"每个额度周期只能申请一次"的限制**——只要有效剩余跌破 `threshold`，就可以申请。为此状态机会自动重新武装：
+
+- 申请提交后处于 `submitted`，此时**不会**每 2 分钟重复提交；
+- 额度补回来后余额**涨回阈值以上** → 状态机复位成 `idle`，下次再跌破阈值立刻再申请一笔；
+- 如果没等到"涨回阈值"，但额度上限 `cap` 变大了（说明新额度已到账，实测一笔申请上限就 +2000）→ 同样允许再申请；
+- 万一申请被驳回、额度一直没到，超过 `escalation.resubmitCooldownMs`（默认 6 小时）后也允许再申请；
+- 真正防重复的只有两道闸：在途锁 `apply.lock`，以及提交脚本写回状态时的时间戳比对。
+
+`cycleKey` 取服务端 `expiresAt`，只用于在**新的计费周期**里清空历史记录，不再是"申请次数"的上限。
 
 ---
 
@@ -162,6 +170,8 @@ node apply/apply-pku.mjs --dry-run
 | `maxLogBytes` | `1048576` | 单个日志文件上限（1 MB），超过后只保留尾部 |
 | `keepLogBytes` | `262144` | 截断时保留的尾部大小（256 KB） |
 | `artifactMaxBytes` | `20971520` | `artifacts/` 目录总大小上限（20 MB），超了删最旧的 |
+| `escalation.dispatchRetryMs` | `600000` | `failed` 之后多久允许重新派发（10 分钟） |
+| `escalation.resubmitCooldownMs` | `21600000` | 已提交后若额度一直没到账，多久允许再申请一次（6 小时） |
 | `paths.applyScript` | `apply/apply-pku.mjs` | 提交层入口，换成你自己的脚本 |
 | `paths.monitorScript` | `monitor/credit-watch.mjs` | 监控层入口（供提交层回报状态） |
 | `guard.processNames` | `["Qoder CN.exe","Qoder.exe"]` | 判定「Qoder 已打开」的进程名 |
@@ -203,7 +213,7 @@ node apply/apply-pku.mjs --dry-run
   > 提交额度时弹出的 **Edge 窗口是故意的**：那是真实提交过程，留着你能亲眼看到填了什么、点了什么。
 
 - **门户改版**会导致定位失败：按钮/字段改名时脚本会把页面结构 dump 到 `artifacts/` 并标记 `failed`，不会乱点。
-- **提交结果不确定**时仍按 `submitted` 处理（宁可少申请一次，也不重复申请），并在 `state.json` 备注里提示人工核实。
+- **提交结果不确定**时仍按 `submitted` 处理（宁可先不重复提交），并在 `state.json` 备注里提示人工核实；之后额度到账或冷却期一过，仍会按上面的规则继续工作。
 - Edge 窗口被关闭或机器重启都没关系：脚本每次都会重新拉起 Edge，登录态保存在专用 profile 里。
 
 ---

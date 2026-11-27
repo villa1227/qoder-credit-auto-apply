@@ -6,6 +6,10 @@
   "maxLogBytes": 1048576,
   "keepLogBytes": 262144,
   "artifactMaxBytes": 20971520,
+  "escalation": {
+    "dispatchRetryMs": 600000,
+    "resubmitCooldownMs": 21600000
+  },
   "paths": {
     "applyScript": "apply/apply-pku.mjs",
     "monitorScript": "monitor/credit-watch.mjs"

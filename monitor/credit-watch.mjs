@@ -64,6 +64,8 @@ function loadConfig() {
   config.heartbeatFile = process.env.QODER_CREDIT_HEARTBEAT_FILE || join(APP_ROOT, 'watch.heartbeat');
   config.watchLogFile = process.env.QODER_CREDIT_WATCH_LOG_FILE || join(APP_ROOT, 'watch.log');
   config.watchLockFile = process.env.QODER_CREDIT_WATCH_LOCK_FILE || join(APP_ROOT, 'watch.lock');
+  config.applyLogFile = process.env.QODER_CREDIT_APPLY_LOG_FILE
+    || appPath(config.paths?.applyLogFile, 'apply.log');
   // Log files are bounded: the watcher appends one line per minute forever, so
   // they are trimmed to their tail once they pass the cap.
   config.maxLogBytes = Number(process.env.QODER_CREDIT_MAX_LOG_BYTES ?? config.maxLogBytes ?? 1024 * 1024);
@@ -138,6 +140,7 @@ function loadState(stateFile = STATE_FILE) {
       dispatchedAt: null,
       appliedAt: null,
       applicationId: null,
+      appliedCap: null,
       lastError: null,
       note: null,
     };
@@ -173,15 +176,28 @@ const TERMINAL_STAGES = new Set(['submitted']);
  * Persist the state without clobbering a newer, terminal state written by the
  * submission script (which marks the state as "submitted" on its own).
  * A quota cycle change is an intentional reset, so it is never merged.
+ *
+ * `force` is used for one deliberate downgrade: when the credits come back
+ * above the threshold, the machine is re-armed so that the next shortage can
+ * trigger a new application. That downgrade must survive the "submitted"
+ * protection, otherwise a single application would block the rest of the
+ * month.
  */
-function mergeSave(state, stateFile = STATE_FILE) {
+function mergeSave(state, stateFile = STATE_FILE, options = {}) {
   const disk = loadState(stateFile);
   if (disk.cycleKey !== state.cycleKey) {
     saveState(state, stateFile);
     return state;
   }
   const merged = { ...disk, ...state };
-  if (TERMINAL_STAGES.has(disk.stage) && !TERMINAL_STAGES.has(state.stage)) {
+  // The audit trail of the last application survives every rewrite.
+  if (merged.appliedAt === undefined) merged.appliedAt = disk.appliedAt;
+  if (merged.applicationId === undefined) merged.applicationId = disk.applicationId;
+  if (
+    !options.force
+    && TERMINAL_STAGES.has(disk.stage)
+    && !TERMINAL_STAGES.has(state.stage)
+  ) {
     merged.stage = disk.stage;
     merged.appliedAt = disk.appliedAt;
     merged.applicationId = disk.applicationId;
@@ -355,6 +371,29 @@ function computeEffectiveRemaining(qoderUsage) {
   return { effective, breakdown };
 }
 
+/**
+ * Sum of the numeric quota caps. Every granted batch enlarges the cap (observed
+ * 2000 -> 4000 -> 6000 inside a single quota cycle), so a growing cap proves
+ * that new credits were granted after the last application - which is the
+ * signal used to tell "still waiting for the grant" from "the grant landed,
+ * and the balance dropped again".
+ */
+function computeCapSignal(qoderUsage) {
+  const caps = [];
+  const add = (pack) => {
+    if (!pack || pack === 'missing' || typeof pack !== 'object') return;
+    if (Number.isFinite(pack.cap)) caps.push(pack.cap);
+  };
+  add(qoderUsage?.userQuota);
+  add(qoderUsage?.orgResourcePackage);
+  add(qoderUsage?.addOnQuota);
+  const dedicated = Array.isArray(qoderUsage?.dedicatedResourcePackages)
+    ? qoderUsage.dedicatedResourcePackages
+    : [];
+  for (const pack of dedicated) add(pack);
+  return caps.length ? caps.reduce((sum, cap) => sum + cap, 0) : null;
+}
+
 
 const DEFAULT_LOCK_FILE = join(APP_ROOT, 'apply.lock');
 
@@ -460,7 +499,7 @@ async function dispatchApply(config, state, snapshotInfo) {
   // No Agent turn, no Qoder credits - the application still goes out when the
   // credit balance is already exhausted.
   const { spawn } = await import('node:child_process');
-  const logFile = join(APP_ROOT, 'apply.log');
+  const logFile = config.applyLogFile || join(APP_ROOT, 'apply.log');
   // apply.log only grows when an application is actually submitted, but keep it
   // bounded all the same.
   rotateLogFile(logFile, logLimits.maxBytes, logLimits.keepBytes);
@@ -493,6 +532,7 @@ async function evaluate(config, options = {}) {
     return { ok: false, reason: 'no-qoder-usage' };
   }
   const { effective, breakdown } = computeEffectiveRemaining(qoderUsage);
+  const capNow = computeCapSignal(qoderUsage);
   const cycleKey = String(qoderUsage.expiresAt ?? 'unknown');
   const cycleExpiresAtIso = Number.isFinite(qoderUsage.expiresAt)
     ? new Date(qoderUsage.expiresAt).toISOString()
@@ -506,6 +546,7 @@ async function evaluate(config, options = {}) {
     state.dispatchedAt = null;
     state.appliedAt = null;
     state.applicationId = null;
+    state.appliedCap = null;
     state.note = 'new quota cycle';
   }
   state.cycleKey = cycleKey;
@@ -516,6 +557,14 @@ async function evaluate(config, options = {}) {
 
   const threshold = config.threshold;
   const below = effective <= threshold;
+  // Save options for this run: `force` lets a deliberate downgrade win over the
+  // "submitted" mark of an earlier application.
+  let saveOptions = {};
+  // When the last application was made, against which cap level.
+  const appliedAtMs = state.appliedAt ? Date.parse(state.appliedAt) : 0;
+  const sinceApplied = appliedAtMs ? Date.now() - appliedAtMs : Infinity;
+  const capAdvanced =
+    Number.isFinite(state.appliedCap) && Number.isFinite(capNow) && capNow > state.appliedCap;
 
   // Freshness guard: never trigger on a stale snapshot.
   const snapshotAgeMs = snapshot.timestamp ? Date.now() - Date.parse(snapshot.timestamp) : Infinity;
@@ -529,10 +578,20 @@ async function evaluate(config, options = {}) {
 
   if (!below) {
     if (state.stage !== 'idle') {
+      const wasSubmitted = state.stage === 'submitted';
       state.stage = 'idle';
-      state.note = null;
+      state.note = wasSubmitted
+        ? 'credits replenished - re-armed, the next shortage applies again'
+        : null;
+      if (wasSubmitted) {
+        log('credits replenished above the threshold - re-armed (no monthly application limit)');
+      }
+      // "submitted" is only terminal while the shortage it answered is still
+      // current. Once the balance recovered, the downgrade to "idle" must win.
+      mergeSave(state, config.stateFile, { force: true });
+    } else {
+      mergeSave(state, config.stateFile);
     }
-    mergeSave(state, config.stateFile);
     log(`effective remaining ${effective} > threshold ${threshold} - idle`);
     return { ok: true, effective, breakdown, below: false, stage: state.stage };
   }
@@ -542,13 +601,39 @@ async function evaluate(config, options = {}) {
     state.triggeredAt = new Date().toISOString();
     state.note = 'threshold reached';
     log(`effective remaining ${effective} <= threshold ${threshold} - TRIGGERED`);
+  } else if (state.stage === 'submitted') {
+    // An application for this shortage is already out. A new one is allowed as
+    // soon as the granted batch arrived (the cap grew) or after the cooldown,
+    // in case the previous application was rejected or never processed.
+    const cooldownMs = Number(config.escalation?.resubmitCooldownMs ?? 6 * 3600 * 1000);
+    if (capAdvanced || sinceApplied > cooldownMs) {
+      state.stage = 'triggered';
+      state.triggeredAt = new Date().toISOString();
+      state.note = capAdvanced
+        ? 'new credits granted and the balance is low again - applying again'
+        : 'the previous application did not arrive - applying again';
+      // From here on the new application owns the state: the "submitted" mark of
+      // the previous run must not win over the deliberate downgrade.
+      saveOptions = { force: true };
+      log(
+        `effective remaining ${effective} <= threshold ${threshold} - RE-APPLYING (${state.note})`,
+      );
+    } else {
+      const waitMin = Math.max(0, Math.round((cooldownMs - sinceApplied) / 60000));
+      log(
+        `effective remaining ${effective} <= threshold ${threshold} - stage=submitted `
+        + `(waiting for the granted batch, next attempt allowed in ~${waitMin} min)`,
+      );
+      mergeSave(state, config.stateFile);
+      return { ok: true, effective, breakdown, below: true, stage: state.stage, skipped: true };
+    }
   } else {
     log(`effective remaining ${effective} <= threshold ${threshold} - stage=${state.stage}`);
   }
 
   if (options.dryRun) {
     state.note = 'dry-run';
-    mergeSave(state, config.stateFile);
+    mergeSave(state, config.stateFile, saveOptions);
     return { ok: true, effective, breakdown, below: true, stage: state.stage, dryRun: true };
   }
 
@@ -568,14 +653,19 @@ async function evaluate(config, options = {}) {
     // Re-read the state: the submission script may have finished and marked the
     // state as "submitted" between our first read and this point.
     const disk = loadState(config.stateFile);
-    if (disk.stage === 'submitted' && disk.cycleKey === state.cycleKey) {
-      log('already submitted in this cycle - skipping dispatch');
-      mergeSave(state, config.stateFile);
+    const diskAppliedAtMs = disk.appliedAt ? Date.parse(disk.appliedAt) : 0;
+    if (
+      disk.stage === 'submitted'
+      && disk.cycleKey === state.cycleKey
+      && diskAppliedAtMs > appliedAtMs
+    ) {
+      log('a submission finished in the meantime - skipping dispatch');
+      mergeSave(state, config.stateFile, saveOptions);
       return { ok: true, effective, breakdown, below: true, stage: disk.stage, skipped: true };
     }
     if (!acquireLock(config.lockFile)) {
       log('another submission is already in flight, skipping dispatch');
-      mergeSave(state, config.stateFile);
+      mergeSave(state, config.stateFile, saveOptions);
       return { ok: true, effective, breakdown, below: true, stage: state.stage, locked: true };
     }
     // Persist the dispatch BEFORE spawning the submission script: the script marks
@@ -585,7 +675,10 @@ async function evaluate(config, options = {}) {
     state.dispatchedAt = new Date().toISOString();
     state.note = 'local browser submission started';
     state.lastError = null;
-    mergeSave(state, config.stateFile);
+    // Remember the grant level this application was made against, so a later
+    // cap increase can be recognised as "new credits arrived".
+    if (Number.isFinite(capNow)) state.appliedCap = capNow;
+    mergeSave(state, config.stateFile, saveOptions);
     try {
       const result = await dispatchApply(config, state, { effective, cycleExpiresAtIso });
       log('dispatched local browser application, pid', result.pid);
@@ -601,7 +694,7 @@ async function evaluate(config, options = {}) {
     }
   }
 
-  mergeSave(state, config.stateFile);
+  mergeSave(state, config.stateFile, saveOptions);
   return { ok: true, effective, breakdown, below: true, stage: state.stage };
 }
 
@@ -685,6 +778,7 @@ async function main() {
     state.dispatchedAt = null;
     state.appliedAt = null;
     state.applicationId = null;
+    state.appliedCap = null;
     state.note = 'manually reset';
     saveState(state, config.stateFile);
     releaseLock(config.lockFile);

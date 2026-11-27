@@ -36,7 +36,7 @@ writeFileSync(
   'utf8',
 );
 
-function writeSnapshot(remaining, expiresAt) {
+function writeSnapshot(remaining, expiresAt, cap = 2000) {
   const payload = {
     operation: 'account.getQuotaUsage',
     status: 200,
@@ -48,10 +48,10 @@ function writeSnapshot(remaining, expiresAt) {
       userQuota: { total: 750, used: 750, remaining: 0, percentage: 1, unit: 'credits' },
       addOnQuota: 'missing',
       orgResourcePackage: {
-        used: 2000 - remaining,
+        used: cap - remaining,
         remaining,
         percentage: 0.5,
-        cap: 2000,
+        cap,
         available: true,
         unit: 'credits',
       },
@@ -75,6 +75,8 @@ function runWatcher(extraArgs = [], extraEnv = {}) {
         QODER_CREDIT_STATE_FILE: STATE,
         QODER_CREDIT_LOCK_FILE: LOCK,
         QODER_CREDIT_HEARTBEAT_FILE: HEARTBEAT,
+        QODER_CREDIT_WATCH_LOG_FILE: join(TMP, 'watch.log'),
+        QODER_CREDIT_APPLY_LOG_FILE: join(TMP, 'apply.log'),
         QODER_CREDIT_APPLY_SCRIPT: STUB,
         // The tests must not depend on Qoder Desktop actually running.
         QODER_CREDIT_GUARD: '0',
@@ -98,6 +100,8 @@ function runTick(env = {}) {
       QODER_CREDIT_STATE_FILE: STATE,
       QODER_CREDIT_LOCK_FILE: LOCK,
       QODER_CREDIT_HEARTBEAT_FILE: HEARTBEAT,
+      QODER_CREDIT_WATCH_LOG_FILE: join(TMP, 'watch.log'),
+      QODER_CREDIT_APPLY_LOG_FILE: join(TMP, 'apply.log'),
       QODER_CREDIT_APPLY_SCRIPT: STUB,
       ...env,
     },
@@ -122,6 +126,13 @@ function resetState() {
 
 function state() {
   return JSON.parse(readFileSync(STATE, 'utf8'));
+}
+
+/** Overwrite a few fields of the state file (to age a timestamp, for example). */
+function patchState(patch) {
+  const next = { ...state(), ...patch };
+  writeFileSync(STATE, `${JSON.stringify(next, null, 2)}\n`, 'utf8');
+  return next;
 }
 
 /** Wait until the stub submission script has advanced the state. */
@@ -236,6 +247,53 @@ const handedOver = existsSync(join(TMP, 'last-remaining.txt'))
   : null;
 check('exhausted balance is handed over as 0', handedOver === '0', String(handedOver));
 check('exhausted balance triggers', state().stage === 'submitted', JSON.stringify(state()));
+
+// 10) there is no "one application per quota cycle" rule. A submitted state only
+//     suppresses a second application while the previous one is fresh and no new
+//     credits have been granted: within the cooldown it must not resubmit.
+const afterExhausted = state().dispatchedAt;
+writeSnapshot(100, 1798214400000, 2000);
+runWatcher();
+check('within cooldown no second application', state().dispatchedAt === afterExhausted, JSON.stringify(state()));
+check('within cooldown stays submitted', state().stage === 'submitted', JSON.stringify(state()));
+
+// 11) once the cooldown has passed (grant assumed lost/rejected) a fresh
+//     application is allowed even though the balance never recovered.
+patchState({ appliedAt: new Date(Date.now() - 7 * 3600 * 1000).toISOString() });
+writeSnapshot(100, 1798214400000, 2000);
+runWatcher();
+check('after cooldown a fresh application dispatches', Boolean(state().dispatchedAt) && state().dispatchedAt !== afterExhausted, JSON.stringify(state()));
+await waitForStage('submitted');
+const afterCooldown = state().dispatchedAt;
+
+// 12) as soon as the granted credits bring the balance back above the threshold,
+//     the machine re-arms to idle - the next shortage must apply again.
+writeSnapshot(900, 1798214400000, 2000);
+runWatcher();
+check('credits replenished re-arms to idle', state().stage === 'idle', JSON.stringify(state()));
+check('re-arm keeps the last application on record', Boolean(state().appliedAt), JSON.stringify(state()));
+
+// 13) the re-armed machine triggers a new application on the next dip.
+writeSnapshot(120, 1798214400000, 2000);
+runWatcher();
+check('next dip after re-arm dispatches', Boolean(state().dispatchedAt) && state().dispatchedAt !== afterCooldown, JSON.stringify(state()));
+await waitForStage('submitted');
+const afterRearm = state().dispatchedAt;
+
+// 14) a grant can also land while the balance is still below the threshold: the
+//     cap grows, which proves new credits arrived, so another application is
+//     allowed immediately - again without any monthly limit.
+check('dispatch recorded the grant level', state().appliedCap === 2000, JSON.stringify(state()));
+writeSnapshot(80, 1798214400000, 4000);
+runWatcher();
+check('grown cap allows another application', Boolean(state().dispatchedAt) && state().dispatchedAt !== afterRearm, JSON.stringify(state()));
+check('appliedCap follows the grant level', state().appliedCap === 4000, JSON.stringify(state()));
+await waitForStage('submitted');
+check('grant-triggered application reaches submitted', state().stage === 'submitted', JSON.stringify(state()));
+
+// 15) the offline suite must never write into the production logs.
+const watchLogPath = join(TMP, 'watch.log');
+check('watch log kept inside the test dir', existsSync(watchLogPath), watchLogPath);
 
 if (!process.env.KEEP_TMP) rmSync(TMP, { recursive: true, force: true });
 console.log(failures.length === 0 ? '\nALL TESTS PASSED' : `\nFAILED: ${failures.join(', ')}`);
