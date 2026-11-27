@@ -390,7 +390,13 @@ async function main() {
   const dryRun = args.includes('--dry-run');
   mkdirSync(ARTIFACT_DIR, { recursive: true });
 
-  const remaining = Number(process.env.REMAINING_CREDITS ?? '0');
+  // The remaining credits come from the monitoring layer. 0 is a perfectly
+  // meaningful value (the quota ran out completely), so only a missing or
+  // unparsable value falls back to the threshold - a truthy check would turn
+  // "0 credits left" into "150 credits left" in the application reason.
+  const rawRemaining = process.env.REMAINING_CREDITS;
+  const parsedRemaining = rawRemaining === undefined || rawRemaining === '' ? NaN : Number(rawRemaining);
+  const remaining = Number.isFinite(parsedRemaining) ? parsedRemaining : Number(config.threshold ?? 0);
   const artifactMaxBytes = Number(config.artifactMaxBytes ?? config.browser?.artifactMaxBytes ?? 20 * 1024 * 1024);
   const prunedBefore = pruneArtifacts(ARTIFACT_DIR, artifactMaxBytes);
   if (prunedBefore.removed) {
@@ -459,7 +465,7 @@ async function main() {
     // 3. fill 申请事由
     const reason = (config.browser.reasonTemplate ?? '剩余{remaining}credits').replace(
       '{remaining}',
-      String(remaining || config.threshold),
+      String(remaining),
     );
     const keywords = config.browser.reasonFieldKeywords
       ?? ['事由', '原因', '理由', 'reason', 'cause', 'content', 'remark', 'description'];

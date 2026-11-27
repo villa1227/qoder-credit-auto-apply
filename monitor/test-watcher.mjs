@@ -21,13 +21,16 @@ rmSync(TMP, { recursive: true, force: true });
 mkdirSync(LOG_DIR, { recursive: true });
 
 // The stub mimics apply-pku.mjs: it marks the state as submitted and releases the lock.
+// It also records the REMAINING_CREDITS it was handed, so the test can check
+// that a balance of exactly 0 is passed on as 0 (and not replaced by a fallback).
 writeFileSync(
   STUB,
   `import { spawnSync } from 'node:child_process';\n` +
-    `import { unlinkSync } from 'node:fs';\n` +
+    `import { unlinkSync, writeFileSync } from 'node:fs';\n` +
     `import { join, dirname } from 'node:path';\n` +
     `import { fileURLToPath } from 'node:url';\n` +
     `const here = dirname(fileURLToPath(import.meta.url));\n` +
+    `writeFileSync(join(here, 'last-remaining.txt'), String(process.env.REMAINING_CREDITS ?? ''));\n` +
     `spawnSync(process.execPath, [join(here, '..', 'credit-watch.mjs'), '--mark', 'submitted', '--note', 'stub applied'], { stdio: 'inherit' });\n` +
     `try { unlinkSync(process.env.QODER_CREDIT_LOCK_FILE); } catch {}\n`,
   'utf8',
@@ -221,6 +224,18 @@ const beatOpen = existsSync(HEARTBEAT) ? JSON.parse(readFileSync(HEARTBEAT, 'utf
 check('heartbeat records qoder running', beatOpen && beatOpen.qoderRunning === true, JSON.stringify(beatOpen));
 await waitForStage('submitted');
 check('tick dispatch reaches submitted', state().stage === 'submitted', JSON.stringify(state()));
+
+// 9) an exhausted balance of exactly 0 must reach the submission script as 0,
+//    not as a fallback value - the reason text on the portal depends on it.
+resetState();
+writeSnapshot(0, 1798214400000);
+runWatcher();
+await waitForStage('submitted');
+const handedOver = existsSync(join(TMP, 'last-remaining.txt'))
+  ? readFileSync(join(TMP, 'last-remaining.txt'), 'utf8').trim()
+  : null;
+check('exhausted balance is handed over as 0', handedOver === '0', String(handedOver));
+check('exhausted balance triggers', state().stage === 'submitted', JSON.stringify(state()));
 
 if (!process.env.KEEP_TMP) rmSync(TMP, { recursive: true, force: true });
 console.log(failures.length === 0 ? '\nALL TESTS PASSED' : `\nFAILED: ${failures.join(', ')}`);
