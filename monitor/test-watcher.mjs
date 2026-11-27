@@ -91,8 +91,8 @@ function runWatcher(extraArgs = [], extraEnv = {}) {
 }
 
 /** Run the scheduled entry point (--tick) with a specific guard setting. */
-function runTick(env = {}) {
-  const result = spawnSync(process.execPath, [MONITOR, '--tick'], {
+function runTick(env = {}, extraArgs = []) {
+  const result = spawnSync(process.execPath, [MONITOR, '--tick', ...extraArgs], {
     encoding: 'utf8',
     env: {
       ...process.env,
@@ -294,6 +294,65 @@ check('grant-triggered application reaches submitted', state().stage === 'submit
 // 15) the offline suite must never write into the production logs.
 const watchLogPath = join(TMP, 'watch.log');
 check('watch log kept inside the test dir', existsSync(watchLogPath), watchLogPath);
+
+// 16) --burst looks at the same healthy balance several times in one wake-up,
+//     but only the first look is logged; identical repeats stay quiet.
+resetState();
+writeSnapshot(900, 1798214400000, 2000);
+writeFileSync(watchLogPath, '', 'utf8');
+const burstHealthy = runTick(
+  {
+    QODER_CREDIT_GUARD: '1',
+    QODER_CREDIT_GUARD_PROCESSES: 'explorer.exe',
+    QODER_CREDIT_BURST_INTERVAL_MS: '300',
+    QODER_CREDIT_BURST_DURATION_MS: '1600',
+  },
+  ['--burst'],
+);
+const burstLog = readFileSync(watchLogPath, 'utf8');
+const burstChecks = Number((burstLog.match(/\((\d+) checks in this burst\)/) ?? [])[1] ?? 0);
+check('burst polls several times', burstChecks >= 3, burstLog.slice(-300));
+const idleLines = (burstLog.match(/> threshold 150 - idle/g) ?? []).length;
+check('burst logs an unchanged balance once', idleLines === 1, String(idleLines));
+check('burst with a healthy balance stays idle', state().stage === 'idle', JSON.stringify(state()));
+check('burst with a healthy balance does not dispatch', !state().dispatchedAt, JSON.stringify(state()));
+check('burst exits cleanly', burstHealthy.status === 0, String(burstHealthy.status));
+
+// 17) a burst sees a low balance and dispatches from inside the loop.
+resetState();
+writeSnapshot(90, 1798214400000, 2000);
+const burstLow = runTick(
+  {
+    QODER_CREDIT_GUARD: '1',
+    QODER_CREDIT_GUARD_PROCESSES: 'explorer.exe',
+    QODER_CREDIT_BURST_INTERVAL_MS: '300',
+    QODER_CREDIT_BURST_DURATION_MS: '1600',
+  },
+  ['--burst'],
+);
+check('burst dispatches on a low balance', Boolean(state().dispatchedAt), JSON.stringify(state()));
+await waitForStage('submitted');
+check('burst dispatch reaches submitted', state().stage === 'submitted', JSON.stringify(state()));
+check('burst low balance exits cleanly', burstLow.status === 0, String(burstLow.status));
+
+// 18) a burst with Qoder closed stops at the first check instead of idling
+//     through its whole duration.
+resetState();
+writeSnapshot(90, 1798214400000, 2000);
+const closedStart = Date.now();
+const burstClosed = runTick(
+  {
+    QODER_CREDIT_GUARD: '1',
+    QODER_CREDIT_GUARD_PROCESSES: 'this-process-does-not-exist-9d1f.exe',
+    QODER_CREDIT_BURST_INTERVAL_MS: '300',
+    QODER_CREDIT_BURST_DURATION_MS: '5000',
+  },
+  ['--burst'],
+);
+const closedElapsed = Date.now() - closedStart;
+check('burst with qoder closed exits immediately', closedElapsed < 3000, `${closedElapsed} ms`);
+check('burst with qoder closed does not dispatch', !state().dispatchedAt, JSON.stringify(state()));
+check('burst with qoder closed exits cleanly', burstClosed.status === 0, String(burstClosed.status));
 
 if (!process.env.KEEP_TMP) rmSync(TMP, { recursive: true, force: true });
 console.log(failures.length === 0 ? '\nALL TESTS PASSED' : `\nFAILED: ${failures.join(', ')}`);

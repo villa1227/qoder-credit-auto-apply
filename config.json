@@ -1,6 +1,10 @@
 {
   "threshold": 150,
   "pollIntervalMs": 60000,
+  "burst": {
+    "intervalMs": 5000,
+    "durationMs": 40000
+  },
   "heartbeatAliveMs": 300000,
   "maxSnapshotAgeHours": 6,
   "maxLogBytes": 1048576,

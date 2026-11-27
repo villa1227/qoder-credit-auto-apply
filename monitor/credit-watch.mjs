@@ -338,6 +338,7 @@ function readQuotaSnapshot(logFile) {
 }
 
 const num = (value) => (typeof value === 'number' && Number.isFinite(value) ? value : 0);
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
  * Effective remaining credits. The quota response may carry several pools; the log encodes
@@ -549,6 +550,12 @@ async function evaluate(config, options = {}) {
     state.appliedCap = null;
     state.note = 'new quota cycle';
   }
+  // Captured before the state is overwritten: in a burst the same snapshot is
+  // re-read every few seconds, and an identical result must not be logged or
+  // written again.
+  const previousEffective = state.effectiveRemaining;
+  const previousSnapshotAt = state.snapshotAt;
+
   state.cycleKey = cycleKey;
   state.effectiveRemaining = effective;
   state.breakdown = breakdown;
@@ -560,6 +567,10 @@ async function evaluate(config, options = {}) {
   // Save options for this run: `force` lets a deliberate downgrade win over the
   // "submitted" mark of an earlier application.
   let saveOptions = {};
+  // In a burst the same value is looked at every few seconds; repeating the
+  // identical line and the identical state write adds only noise.
+  const unchanged = previousEffective === effective && previousSnapshotAt === snapshot.timestamp;
+  const quiet = Boolean(options.quietIdle) && unchanged;
   // When the last application was made, against which cap level.
   const appliedAtMs = state.appliedAt ? Date.parse(state.appliedAt) : 0;
   const sinceApplied = appliedAtMs ? Date.now() - appliedAtMs : Infinity;
@@ -589,10 +600,10 @@ async function evaluate(config, options = {}) {
       // "submitted" is only terminal while the shortage it answered is still
       // current. Once the balance recovered, the downgrade to "idle" must win.
       mergeSave(state, config.stateFile, { force: true });
-    } else {
+    } else if (!quiet) {
       mergeSave(state, config.stateFile);
     }
-    log(`effective remaining ${effective} > threshold ${threshold} - idle`);
+    if (!quiet) log(`effective remaining ${effective} > threshold ${threshold} - idle`);
     return { ok: true, effective, breakdown, below: false, stage: state.stage };
   }
 
@@ -620,14 +631,16 @@ async function evaluate(config, options = {}) {
       );
     } else {
       const waitMin = Math.max(0, Math.round((cooldownMs - sinceApplied) / 60000));
-      log(
-        `effective remaining ${effective} <= threshold ${threshold} - stage=submitted `
-        + `(waiting for the granted batch, next attempt allowed in ~${waitMin} min)`,
-      );
-      mergeSave(state, config.stateFile);
+      if (!quiet) {
+        log(
+          `effective remaining ${effective} <= threshold ${threshold} - stage=submitted `
+          + `(waiting for the granted batch, next attempt allowed in ~${waitMin} min)`,
+        );
+        mergeSave(state, config.stateFile);
+      }
       return { ok: true, effective, breakdown, below: true, stage: state.stage, skipped: true };
     }
-  } else {
+  } else if (!quiet) {
     log(`effective remaining ${effective} <= threshold ${threshold} - stage=${state.stage}`);
   }
 
@@ -791,14 +804,41 @@ async function main() {
     // Desktop actually running: while Qoder is closed there is no fresh quota
     // in the log, and the point of the task is to never monitor on its own.
     setLogFileSink(config.watchLogFile);
-    const running = qoderRunning(config);
-    writeHeartbeat(config, { qoderRunning: running });
-    if (!running) {
-      log('qoder is not running - nothing to monitor');
-      return;
+    // `--burst`: the task wakes up once a minute and then keeps looking for ~40
+    // seconds instead of a single glance, so the balance is sampled every few
+    // seconds. Still no resident process - the burst ends by itself, and if
+    // Qoder is closed the very first check stops it immediately. The ~20 s gap
+    // left before the next wake-up matters: with IgnoreNew, a still-running
+    // burst makes Task Scheduler refuse the next trigger.
+    const burst = Boolean(args.burst);
+    const burstIntervalMs = Number(
+      process.env.QODER_CREDIT_BURST_INTERVAL_MS ?? config.burst?.intervalMs ?? 5000,
+    );
+    const burstDurationMs = Number(
+      process.env.QODER_CREDIT_BURST_DURATION_MS ?? config.burst?.durationMs ?? 40000,
+    );
+    const deadline = burst ? Date.now() + burstDurationMs : 0;
+    let checks = 0;
+    let result = null;
+    for (;;) {
+      checks += 1;
+      const running = qoderRunning(config);
+      writeHeartbeat(config, { qoderRunning: running, burst, checks });
+      if (!running) {
+        log(checks === 1
+          ? 'qoder is not running - nothing to monitor'
+          : 'qoder was closed mid-burst - stopping');
+        return;
+      }
+      result = await evaluate(config, { quietIdle: burst });
+      if (result.dispatched) break;
+      if (!burst || Date.now() + burstIntervalMs > deadline) break;
+      await sleep(burstIntervalMs);
     }
-    const result = await evaluate(config, {});
-    log(`tick finished: effective=${result.effective ?? 'n/a'} stage=${result.stage ?? 'n/a'}`);
+    log(
+      `tick finished: effective=${result?.effective ?? 'n/a'} stage=${result?.stage ?? 'n/a'}`
+      + (checks > 1 ? ` (${checks} checks in this burst)` : ''),
+    );
     return;
   }
 

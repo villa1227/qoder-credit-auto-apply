@@ -68,18 +68,23 @@ monitor/credit-watch.mjs  更新状态机
 Qoder Desktop 刷新额度接口（仅在 Qoder 运行时）
         │  （服务端把归一化额度 JSON 写进本地日志的「用量响应摘要」行）
         ▼
-计划任务每 2 分钟跑一次 --tick
+计划任务每 1 分钟跑一次 --tick --burst
         │  ① 先看 Qoder 进程在不在
         │     不在 → 直接退出，什么都不做（开机不启动、Qoder 没开不工作）
-        ▼  ② 在 → 解析日志尾部
-        │  有效剩余 = userQuota + orgResourcePackage(available)
-        │            + addOnQuota + Σ dedicatedResourcePackages
+        ▼  ② 在 → 连续 ~40 秒、每 5 秒解析一次日志尾部
+        │     有效剩余 = userQuota + orgResourcePackage(available)
+        │              + addOnQuota + Σ dedicatedResourcePackages
         ▼
 ≤ 150 ? ── 否 ──▶ idle（继续观察）
         │ 是
         ▼
 triggered → dispatched ──▶ apply/apply-pku.mjs（Edge/CDP 自动填表 → 点提交 → 勾选审批人 → 确认）→ submitted | failed
 ```
+
+> 为什么是「1 分钟一次 + 40 秒内每 5 秒」而不是简单的每分钟看一眼：Qoder 的额度快照是**成簇写入**的
+> （实测同一轮对话里每隔几秒连续几行，轮与轮之间可能隔几分钟甚至更久），余额从 150 以上掉到 0
+> 往往就发生在几秒之内。单次瞥一眼很容易错过，改成短爆发后采样粒度约 5 秒，
+> 同时仍然没有常驻进程 —— 爆发到点自己结束，Qoder 一关下一轮就立即退出。
 
 > 提交的最后一步是门户弹出的「请选择下一个节点审批人」：必须勾选审批节点再点「确认」，申请才算真正提交。
 > 只有看到弹窗关闭 + 成功提示 / 页面跳走，才会记 `submitted`；表单还停在页面上则记 `failed` 并自动重试。
@@ -109,16 +114,17 @@ triggered → dispatched ──▶ apply/apply-pku.mjs（Edge/CDP 自动填表 �
 
    | 任务 | 触发 | 说明 |
    | --- | --- | --- |
-   | `QoderCreditWatch` | 每 2 分钟 | 调度 tick：Qoder 在跑才监测，不跑就退出 |
+   | `QoderCreditWatch` | 每 1 分钟 | 调度 tick + 40 秒短爆发（每 5 秒看一次）：Qoder 在跑才监测，不跑就退出 |
    | `QoderCreditCheck` | 每 6 小时 | 兜底自愈：心跳还新鲜就跳过，否则补一次检查 |
 
 3. **验证**
 
    ```cmd
    node monitor/credit-watch.mjs --status       REM 当前状态机
-   node monitor/credit-watch.mjs --tick         REM 跑一次调度 tick（不提交）
+   node monitor/credit-watch.mjs --tick         REM 跑一次调度 tick（单次，不提交）
+   node monitor/credit-watch.mjs --tick --burst REM 跑一次 40 秒爆发（单次检查仍不提交）
    node monitor/credit-watch.mjs --once --dry-run REM 只报告不派发
-   node monitor/test-watcher.mjs                 REM 离线测试（30 项）
+   node monitor/test-watcher.mjs                 REM 离线测试（51 项）
    node apply/apply-pku.mjs --verify-click        REM 验证自动点击（拦截提交，不产生申请）
    ```
 
@@ -152,7 +158,7 @@ node apply/apply-pku.mjs --dry-run
 
 **没有"每个额度周期只能申请一次"的限制**——只要有效剩余跌破 `threshold`，就可以申请。为此状态机会自动重新武装：
 
-- 申请提交后处于 `submitted`，此时**不会**每 2 分钟重复提交；
+- 申请提交后处于 `submitted`，此时**不会**每次检查都重复提交；
 - 额度补回来后余额**涨回阈值以上** → 状态机复位成 `idle`，下次再跌破阈值立刻再申请一笔；
 - 如果没等到"涨回阈值"，但额度上限 `cap` 变大了（说明新额度已到账，实测一笔申请上限就 +2000）→ 同样允许再申请；
 - 万一申请被驳回、额度一直没到，超过 `escalation.resubmitCooldownMs`（默认 6 小时）后也允许再申请；
@@ -167,7 +173,9 @@ node apply/apply-pku.mjs --dry-run
 | 键 | 默认 | 说明 |
 | --- | --- | --- |
 | `threshold` | `150` | 触发阈值（有效剩余 credits） |
-| `pollIntervalMs` | `60000` | 常驻模式下的轮询间隔 |
+| `burst.intervalMs` | `5000` | 短爆发的采样间隔（每 5 秒看一次日志） |
+| `burst.durationMs` | `40000` | 短爆发持续多久后退出（40 秒，留 20 秒余量给下一轮 tick） |
+| `pollIntervalMs` | `60000` | 常驻模式（`--watch`，默认不用）下的轮询间隔 |
 | `heartbeatAliveMs` | `300000` | 心跳保鲜期，超过则认为调度任务挂了 |
 | `maxSnapshotAgeHours` | `6` | 快照超过这个小时数视为过期，不触发 |
 | `maxLogBytes` | `1048576` | 单个日志文件上限（1 MB），超过后只保留尾部 |
@@ -188,9 +196,16 @@ node apply/apply-pku.mjs --dry-run
 ## 已知限制
 
 - **只在 Qoder Desktop 打开时监测**。Qoder 不写 Windows 事件日志，而 WMI 事件订阅需要管理员权限，
-  所以用「每 2 分钟一次的调度 tick + 进程检测」实现：Qoder 关着时 tick 立刻退出，
+  所以用「每 1 分钟一次的调度 tick + 40 秒短爆发 + 进程检测」实现：Qoder 关着时 tick 立刻退出，
   机器上不留常驻进程，也不会有常驻控制台窗口。
-  tick 间隔在 `register-tasks.ps1` 里的 `$tickMinutes` 调整。
+  tick 间隔在 `register-tasks.ps1` 里的 `$tickMinutes`，爆发参数在 `config.json` 的 `burst`。
+
+- **检测延迟通常 ≈ 5 秒，最坏 ≈ 25 秒**。额度判定只看 Qoder 自己写进日志的快照，
+  不额外请求接口，所以延迟的物理下限就是 Qoder 刷新快照的节奏。
+  每轮爆发覆盖 40 秒、每 5 秒看一次，因此快照落在覆盖区间内时最多 5 秒就能发现；
+  落在两轮之间的 ~20 秒空档里，则要等下一轮。实测 Qoder 在对话中每隔几秒连续写几行，
+  对话之间可能隔几分钟甚至更久；真正危险的是「一轮对话里余额从 150+ 直接掉到 0」，
+  这种下跌一定伴随连续写入，正是爆发能抓住的场景。
 
 - **应用目录可以是任意路径，含中文也没问题**（实测：计划任务直接调用 node 时中文脚本路径正常，`conhost --headless` 同样正常）。搬迁用一条命令：
 

@@ -31,9 +31,13 @@ $base = $PSScriptRoot
 $monitor = Join-Path $base 'monitor\credit-watch.mjs'
 if (-not (Test-Path $monitor)) { throw "monitor script not found: $monitor" }
 
-# How often the scheduled tick wakes up. Two minutes is plenty: the balance
-# only changes when Qoder refreshes its quota, and the tick costs nothing.
-$tickMinutes = 2
+# How often the scheduled tick wakes up. Qoder writes its quota snapshot in
+# short second-level bursts, and the balance can fall from "just above 150"
+# to 0 inside one such burst, so a single look per minute would miss it.
+# Each wake-up therefore runs a short burst: --burst re-reads the log every
+# few seconds for ~40 seconds (config.json "burst"), then exits. That gives a
+# ~5 s granularity while still leaving no resident process behind.
+$tickMinutes = 1
 
 # Resolve node from the machine rather than hardcoding a path.
 $node = (Get-Command node.exe -ErrorAction SilentlyContinue).Source
@@ -86,15 +90,18 @@ foreach ($stale in 'watch.lock','watch.heartbeat','apply.lock') {
 $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
 
 # The scheduled tick. It writes watch.log itself, so stdout is irrelevant.
+# --burst: wake every minute, then poll the log ~every 5 s for ~40 s. Each
+# iteration first checks whether Qoder is running; if it has closed, the burst
+# stops immediately.
 $watch = New-ScheduledTaskAction `
   -Execute $conhost `
-  -Argument "--headless `"$node`" `"$monitor`" --tick" `
+  -Argument "--headless `"$node`" `"$monitor`" --tick --burst" `
   -WorkingDirectory $env:USERPROFILE
 # A pure time trigger: the tick must not depend on a logon event, it simply
-# runs every few minutes and checks whether Qoder Desktop is open.
+# runs every minute and checks whether Qoder Desktop is open.
 $watchTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes $tickMinutes)
 $watchSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::FromMinutes(10)) -MultipleInstances IgnoreNew
-Register-ScheduledTask -TaskName 'QoderCreditWatch' -Action $watch -Trigger $watchTrigger -Settings $watchSettings -Principal $principal -Description 'Passive Qoder credit monitor: ticks every few minutes and only looks at the quota while Qoder Desktop is running' -Force -ErrorAction Stop | Out-Null
+Register-ScheduledTask -TaskName 'QoderCreditWatch' -Action $watch -Trigger $watchTrigger -Settings $watchSettings -Principal $principal -Description 'Passive Qoder credit monitor: ticks every minute, bursts for ~40 s, and only looks at the quota while Qoder Desktop is running' -Force -ErrorAction Stop | Out-Null
 
 # Low-frequency fallback check: no-op while the scheduled tick is alive.
 $check = New-ScheduledTaskAction `
