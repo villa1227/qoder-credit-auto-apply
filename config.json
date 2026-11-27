@@ -1,0 +1,40 @@
+{
+  "threshold": 150,
+  "pollIntervalMs": 60000,
+  "maxSnapshotAgeHours": 6,
+  "maxLogBytes": 1048576,
+  "keepLogBytes": 262144,
+  "artifactMaxBytes": 20971520,
+  "browser": {
+    "port": 9333,
+    "profileDir": "browser-profile",
+    "headless": false,
+    "waitLoginMinutes": 180,
+    "applyButtonText": "立即申请",
+    "reasonTemplate": "剩余{remaining}credits",
+    "submitButtonTexts": [
+      "立即提交"
+    ],
+    "reasonFieldSelectors": [
+      "请输入申请事由"
+    ],
+    "reasonFieldKeywords": [
+      "事由",
+      "原因",
+      "理由",
+      "reason",
+      "cause",
+      "remark",
+      "description"
+    ],
+    "confirmButtonTexts": [
+      "确定",
+      "确认",
+      "确认提交"
+    ],
+    "draftDialogChoice": "重新开始"
+  },
+  "application": {
+    "url": "https://wsyy.pku.edu.cn/fe/site/matterDetails?app_id=575"
+  }
+}
