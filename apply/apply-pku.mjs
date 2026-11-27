@@ -26,6 +26,7 @@ import { join, dirname, resolve, isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { Browser, Page, launchBrowser, isPortAlive, sleep } from './browser-driver.mjs';
+import { handleApproverDialog } from './approver-dialog.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 // The application root is the parent of this folder; the config, the runtime
@@ -287,21 +288,60 @@ async function readInterceptorCount(page) {
   return Number(count) || 0;
 }
 
-const SUBMIT_OK_PATTERN = /(提交成功|申请成功|提交申请成功|已提交|受理成功|申请已提交)/;
-const SUBMIT_REJECT_PATTERN = /(请输入申请事由|请填写|不能为空|必填|请选择|格式不正确|请完善)/;
+const SUBMIT_OK_PATTERN = /(提交成功|申请成功|提交申请成功|受理成功|已成功提交)/;
+const SUBMIT_REJECT_PATTERN = /(请输入申请事由|请填写|不能为空|必填|格式不正确|请完善)/;
+
+/**
+ * What does the portal currently say about the submission?
+ *
+ * The whole body text must NOT be used: the "边聊边办" sidebar contains
+ * "查看已提交申请的审批状态" and "检查必填项", which made the first unattended
+ * run report a success that never happened. Only real message/toast elements
+ * (and the disappearance of the form) are trusted.
+ */
+async function probeSubmitOutcome(page) {
+  const script = `
+    const vis = (el) => el && el.getClientRects().length > 0;
+    const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+    const DIALOG = '[role=dialog],.n-modal,.n-dialog,.ant-modal,.el-dialog,.n-message-box';
+    const dialogs = Array.from(document.querySelectorAll(DIALOG)).filter(vis);
+    const approverDialog = dialogs.some((d) => /审批人|审批节点/.test(norm(d.innerText)));
+    const messages = Array.from(document.querySelectorAll(
+      '.n-message,.n-notification,.n-alert,.ant-message,.ant-notification,.el-message,.el-notification,[role=alert],[class*=toast],[class*=Toast]'
+    )).filter((el) => vis(el) && !el.closest(DIALOG))
+      .map((el) => norm(el.innerText)).filter(Boolean).join(' | ');
+    const textarea = Array.from(document.querySelectorAll('textarea')).some(vis);
+    const submitButton = Array.from(document.querySelectorAll('button,a,[role=button]'))
+      .some((b) => vis(b) && /立即提交/.test(norm(b.innerText)));
+    return { approverDialog, messages, formOpen: textarea || submitButton, url: location.href };
+  `;
+  return page.evaluate(script);
+}
 
 /**
  * Wait until the portal says what happened. A dispatched click is not a
- * submission - only the page text can tell the two apart.
+ * submission - only the page itself can tell the two apart.
+ *
+ * `needsApprover` is returned as soon as the "请选择下一个节点审批人" modal
+ * appears; that step must be handled before any success can be expected.
  */
 async function waitForSubmitOutcome(page, timeoutMs = 15000) {
   const deadline = Date.now() + timeoutMs;
   let text = '';
+  let formClosedStreak = 0;
   while (Date.now() < deadline) {
     // eslint-disable-next-line no-await-in-loop
-    text = await readPageText(page, 2000).catch(() => text);
-    if (SUBMIT_OK_PATTERN.test(text)) return { ok: true, rejected: false, text };
-    if (SUBMIT_REJECT_PATTERN.test(text)) return { ok: false, rejected: true, text };
+    const seen = await probeSubmitOutcome(page).catch(() => null);
+    if (seen) {
+      text = seen.messages || text;
+      if (seen.approverDialog) return { ok: false, rejected: false, needsApprover: true, text };
+      if (SUBMIT_OK_PATTERN.test(seen.messages)) return { ok: true, rejected: false, text };
+      if (SUBMIT_REJECT_PATTERN.test(seen.messages)) return { ok: false, rejected: true, text };
+      // Two consecutive polls without the form: the portal navigated away
+      // (usually to the list of applications), which means it was accepted.
+      formClosedStreak = seen.formOpen ? 0 : formClosedStreak + 1;
+      if (formClosedStreak >= 2) return { ok: true, rejected: false, text: `form closed (${seen.url})` };
+    }
     // eslint-disable-next-line no-await-in-loop
     await sleep(700);
   }
@@ -481,6 +521,9 @@ async function dismissDialogs(page, config) {
   const choices = [
     config.browser.draftDialogChoice ?? '重新开始',
     '继续填写',
+    // A leftover "请选择下一个节点审批人" modal from an earlier attempt belongs to
+    // nobody now: back out of it instead of confirming an approval blindly.
+    '返回',
     '确定',
     '确认',
   ];
@@ -720,7 +763,27 @@ async function main() {
         await page.screenshot(join(ARTIFACT_DIR, `submit-click-${attempt}.png`));
         // Do not assume the click did something: wait for the portal to say so.
         // eslint-disable-next-line no-await-in-loop
-        const outcome = await waitForSubmitOutcome(page, 15000);
+        let outcome = await waitForSubmitOutcome(page, 15000);
+        if (outcome.needsApprover) {
+          // 提交前的最后一步：选择下一个审批节点并确认。
+          log('approver selection dialog appeared - ticking the approver');
+          // eslint-disable-next-line no-await-in-loop
+          const handled = await handleApproverDialog(page, config, sleep);
+          // eslint-disable-next-line no-await-in-loop
+          await page.screenshot(join(ARTIFACT_DIR, `approver-${attempt}.png`));
+          writeFileSync(join(ARTIFACT_DIR, 'approver.json'), JSON.stringify(handled, null, 2), 'utf8');
+          log('approver dialog result:', JSON.stringify(handled));
+          if (handled.confirmed) {
+            // eslint-disable-next-line no-await-in-loop
+            outcome = await waitForSubmitOutcome(page, 30000);
+          } else {
+            outcome = {
+              ok: false,
+              rejected: true,
+              text: `APPROVER_NOT_CONFIRMED ${JSON.stringify(handled)}`,
+            };
+          }
+        }
         if (outcome.ok) {
           submitted = true;
           log('portal confirmed the submission');
@@ -746,7 +809,8 @@ async function main() {
     if (!submitted) {
       const dump = await inspectPage(page);
       writeFileSync(join(ARTIFACT_DIR, 'no-submit-button.json'), JSON.stringify(dump, null, 2), 'utf8');
-      throw new Error('SUBMIT_BUTTON_NOT_FOUND');
+      const clickedAnything = attempts.some((a) => a.found);
+      throw new Error(clickedAnything ? 'SUBMIT_NOT_CONFIRMED' : 'SUBMIT_BUTTON_NOT_FOUND');
     }
 
     // 4b. a confirmation dialog may pop up -> confirm it (dialogs only)
@@ -756,12 +820,27 @@ async function main() {
     await page.screenshot(join(ARTIFACT_DIR, 'after-submit.png'));
     writeFileSync(join(ARTIFACT_DIR, 'after-submit.txt'), after, 'utf8');
 
-    const ok = /(提交成功|申请成功|提交申请成功|已提交|受理成功|申请已提交)/.test(after);
+    // Never trust the raw body text here: the sidebar contains words like
+    // "已提交", which once turned a blocked submission into a fake success.
+    const finalState = await probeSubmitOutcome(page).catch(() => null);
+    const ok = Boolean(
+      finalState
+      && !finalState.approverDialog
+      && (!finalState.formOpen || SUBMIT_OK_PATTERN.test(finalState.messages)),
+    );
+    const stillOnForm = Boolean(finalState?.formOpen && !finalState?.approverDialog);
     if (ok) {
       log('SUBMIT SUCCESS');
       console.log(`SUBMIT_SUCCESS reason=${reason}`);
       markState('submitted', { note: `申请已提交，事由：${reason}` });
       exitCode = 0;
+    } else if (stillOnForm) {
+      // The form is still on screen and nothing confirmed it: the application did
+      // NOT go through. Mark it failed so the next tick retries (10 minutes).
+      log('the form is still open after submitting - the application did not go through');
+      console.log(`SUBMIT_FAILED reason=${reason} text=${after.slice(0, 300)}`);
+      markState('failed', { note: '提交未完成（表单仍在页面上），稍后自动重试' });
+      exitCode = 1;
     } else {
       log('submit result uncertain, page text:', after.slice(0, 400));
       console.log(`SUBMIT_UNCERTAIN reason=${reason} text=${after.slice(0, 300)}`);

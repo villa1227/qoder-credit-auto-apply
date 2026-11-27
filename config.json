@@ -49,6 +49,15 @@
       "确认",
       "确认提交"
     ],
+    "approverDialogKeywords": [
+      "审批人",
+      "审批节点"
+    ],
+    "approverConfirmTexts": [
+      "确认",
+      "确定",
+      "提交"
+    ],
     "draftDialogChoice": "重新开始"
   },
   "application": {

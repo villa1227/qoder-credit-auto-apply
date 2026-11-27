@@ -78,8 +78,11 @@ Qoder Desktop 刷新额度接口（仅在 Qoder 运行时）
 ≤ 150 ? ── 否 ──▶ idle（继续观察）
         │ 是
         ▼
-triggered → dispatched ──▶ apply/apply-pku.mjs（Edge/CDP 自动填表提交）→ submitted
+triggered → dispatched ──▶ apply/apply-pku.mjs（Edge/CDP 自动填表 → 点提交 → 勾选审批人 → 确认）→ submitted | failed
 ```
+
+> 提交的最后一步是门户弹出的「请选择下一个节点审批人」：必须勾选审批节点再点「确认」，申请才算真正提交。
+> 只有看到弹窗关闭 + 成功提示 / 页面跳走，才会记 `submitted`；表单还停在页面上则记 `failed` 并自动重试。
 
 **有效剩余不是单个额度包**：个人包经常已经耗尽而机构共享包还有余额，因此阈值必须按各池之和计算，否则个人包一归零就会误触发申请。
 
