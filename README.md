@@ -13,6 +13,17 @@
 - 提交方式：本地脚本驱动 **Edge over CDP**（零 npm 依赖），自动填「剩余\<NNN\>credits」并点击「立即提交」
 - 默认阈值：有效剩余 ≤ **150 credits**
 
+### 下载者须知（三步）
+
+1. **装依赖**：只要 Node.js ≥ 22，别的都不用装（零 npm 依赖）。
+2. **改提交层**：打开 `config.json` 的 `application` / `browser` 两段，把门户 URL、按钮文案、
+   事由输入框特征串换成你自己学校的；结构差太多就重写 `apply/apply-pku.mjs`
+   （契约见 [`apply/README.md`](apply/README.md)）。**这一步不做的话，监控能跑，但提交会失败。**
+3. **注册计划任务**：先手动登录一次你的门户（脚本会停在那儿等你），再执行
+   `powershell -NoProfile -ExecutionPolicy Bypass -File .\register-tasks.ps1`。
+
+`monitor/` 那一层（读日志、算额度、阈值判定、状态机、去重、派发）**不需要改**。
+
 ---
 
 ## 目录结构（两层）
