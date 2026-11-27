@@ -115,7 +115,8 @@ triggered → dispatched ──▶ apply/apply-pku.mjs（Edge/CDP 自动填表�
    node monitor/credit-watch.mjs --status       REM 当前状态机
    node monitor/credit-watch.mjs --tick         REM 跑一次调度 tick（不提交）
    node monitor/credit-watch.mjs --once --dry-run REM 只报告不派发
-   node monitor/test-watcher.mjs                 REM 离线测试（28 项）
+   node monitor/test-watcher.mjs                 REM 离线测试（30 项）
+   node apply/apply-pku.mjs --verify-click        REM 验证自动点击（拦截提交，不产生申请）
    ```
 
 ---

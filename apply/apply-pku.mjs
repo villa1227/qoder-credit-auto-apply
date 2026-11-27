@@ -164,6 +164,105 @@ async function clickByText(page, text, { timeoutMs = 0 } = {}) {
 }
 
 /**
+ * Locate the submit button and report its state.
+ * "Found" is not enough: a disabled button or a stale coordinate means the
+ * click would go nowhere, so the state is captured right before the click.
+ */
+async function probeSubmitButton(page, text) {
+  const script = `
+    const wanted = ${JSON.stringify(text)};
+    const nodes = Array.from(document.querySelectorAll('button,a,[role=button],input[type=button],input[type=submit]'));
+    const visible = nodes.filter((el) => el.getClientRects().length > 0);
+    const label = (el) => (el.innerText || el.value || '').replace(/\\s+/g, ' ').trim();
+    const candidates = visible.map((el) => ({ el, text: label(el) })).filter((c) => c.text);
+    const hit = candidates.find((c) => c.text === wanted)
+      || candidates.find((c) => c.text.startsWith(wanted))
+      || candidates.find((c) => c.text.includes(wanted));
+    if (!hit) return { found: false, texts: candidates.map((c) => c.text).slice(0, 40) };
+    const target = hit.el.closest('button,a,[role=button]') || hit.el;
+    target.scrollIntoView({ block: 'center' });
+    const rect = target.getBoundingClientRect();
+    return {
+      found: true,
+      text: hit.text,
+      tag: target.tagName,
+      disabled: Boolean(target.disabled) || target.getAttribute('aria-disabled') === 'true',
+      x: rect.left + rect.width / 2,
+      y: rect.top + rect.height / 2,
+    };
+  `;
+  return page.evaluate(script);
+}
+
+/**
+ * Arm a capture-phase interceptor on the submit button.
+ * The click is swallowed and counted, so the portal never receives it: this
+ * proves that the synthetic mouse event really reaches the button, without
+ * creating an application.
+ */
+async function armSubmitInterceptor(page, texts) {
+  const script = `
+    const texts = ${JSON.stringify(texts)};
+    const nodes = Array.from(document.querySelectorAll('button,a,[role=button],input[type=button],input[type=submit]'));
+    const visible = nodes.filter((el) => el.getClientRects().length > 0);
+    const label = (el) => (el.innerText || el.value || '').replace(/\\s+/g, ' ').trim();
+    const labelled = visible.map((el) => ({ el, text: label(el) }));
+    let hit = null;
+    for (const wanted of texts) {
+      hit = labelled.find((c) => c.text === wanted) || labelled.find((c) => c.text.startsWith(wanted));
+      if (hit) break;
+    }
+    if (!hit) return { ok: false };
+    const target = hit.el.closest('button,a,[role=button]') || hit.el;
+    window.__qoderSubmitHits = 0;
+    target.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      window.__qoderSubmitHits += 1;
+    }, true);
+    target.scrollIntoView({ block: 'center' });
+    const rect = target.getBoundingClientRect();
+    return {
+      ok: true,
+      button: {
+        text: hit.text,
+        tag: target.tagName,
+        x: rect.left + rect.width / 2,
+        y: rect.top + rect.height / 2,
+      },
+    };
+  `;
+  return page.evaluate(script);
+}
+
+/** How often the interceptor caught a click. */
+async function readInterceptorCount(page) {
+  const count = await page.evaluate('return Number(window.__qoderSubmitHits || 0);');
+  return Number(count) || 0;
+}
+
+const SUBMIT_OK_PATTERN = /(提交成功|申请成功|提交申请成功|已提交|受理成功|申请已提交)/;
+const SUBMIT_REJECT_PATTERN = /(请输入申请事由|请填写|不能为空|必填|请选择|格式不正确|请完善)/;
+
+/**
+ * Wait until the portal says what happened. A dispatched click is not a
+ * submission - only the page text can tell the two apart.
+ */
+async function waitForSubmitOutcome(page, timeoutMs = 15000) {
+  const deadline = Date.now() + timeoutMs;
+  let text = '';
+  while (Date.now() < deadline) {
+    // eslint-disable-next-line no-await-in-loop
+    text = await readPageText(page, 2000).catch(() => text);
+    if (SUBMIT_OK_PATTERN.test(text)) return { ok: true, rejected: false, text };
+    if (SUBMIT_REJECT_PATTERN.test(text)) return { ok: false, rejected: true, text };
+    // eslint-disable-next-line no-await-in-loop
+    await sleep(700);
+  }
+  return { ok: false, rejected: false, text };
+}
+
+/**
  * Open the application form: click "立即申请" and wait for the form page.
  * The portal either navigates in place or opens a new tab; both are handled.
  */
@@ -386,7 +485,11 @@ async function attachWithRetry(browser, targetId, attempts = 8) {
 async function main() {
   const config = loadConfig();
   const args = process.argv.slice(2);
-  const mode = args.includes('--inspect') ? 'inspect' : 'apply';
+  const mode = args.includes('--inspect')
+    ? 'inspect'
+    : args.includes('--verify-click')
+      ? 'verify-click'
+      : 'apply';
   const dryRun = args.includes('--dry-run');
   mkdirSync(ARTIFACT_DIR, { recursive: true });
 
@@ -482,6 +585,8 @@ async function main() {
     }
     await page.screenshot(join(ARTIFACT_DIR, 'before-submit.png'));
 
+    const submitTexts = config.browser.submitButtonTexts ?? ['立即提交'];
+
     if (dryRun) {
       log('dry-run: not submitting');
       console.log(`DRY_RUN_FILLED reason=${reason} field=${JSON.stringify(filled)}`);
@@ -489,23 +594,95 @@ async function main() {
       return;
     }
 
+    if (mode === 'verify-click') {
+      // Verify the synthetic click without creating an application: the button
+      // gets a capture-phase interceptor that swallows the click and counts it.
+      // If the counter goes up, the mouse event really reached the button.
+      const armed = await armSubmitInterceptor(page, submitTexts);
+      if (!armed.ok) {
+        throw new Error('SUBMIT_BUTTON_NOT_FOUND');
+      }
+      log('interceptor armed on', JSON.stringify(armed.button));
+      await page.activate();
+      await sleep(400);
+      await page.clickAt(armed.button.x, armed.button.y);
+      await sleep(1500);
+      const hits = await readInterceptorCount(page);
+      await page.screenshot(join(ARTIFACT_DIR, 'verify-click.png'));
+      writeFileSync(
+        join(ARTIFACT_DIR, 'verify-click.json'),
+        JSON.stringify({ armed, hits, reason }, null, 2),
+        'utf8',
+      );
+      if (hits > 0) {
+        log('VERIFY_CLICK_OK - the click reached the button, the portal did not see it');
+        console.log(`VERIFY_CLICK_OK hits=${hits} reason=${reason}`);
+        exitCode = 0;
+      } else {
+        log('VERIFY_CLICK_FAILED - the click never reached the button');
+        console.log(`VERIFY_CLICK_FAILED hits=${hits} reason=${reason}`);
+        exitCode = 4;
+      }
+      return;
+    }
+
     // 4. submit
     let submitted = false;
-    for (const text of config.browser.submitButtonTexts ?? ['立即提交']) {
-      // eslint-disable-next-line no-await-in-loop
-      const result = await clickByText(page, text, { timeoutMs: 5000 });
-      if (result?.clicked) {
-        submitted = true;
-        log('clicked submit button', text);
-        break;
+    const attempts = [];
+    for (const text of submitTexts) {
+      for (let attempt = 1; attempt <= 2 && !submitted; attempt += 1) {
+        // eslint-disable-next-line no-await-in-loop
+        const probe = await probeSubmitButton(page, text);
+        attempts.push({ text, attempt, ...probe });
+        if (!probe.found) break;
+        if (probe.disabled) {
+          log(`submit button "${text}" is disabled - waiting (attempt ${attempt})`);
+          // eslint-disable-next-line no-await-in-loop
+          await sleep(2000);
+          continue;
+        }
+        log(
+          `clicking submit button "${text}" (attempt ${attempt}) at`,
+          Math.round(probe.x), Math.round(probe.y),
+        );
+        // eslint-disable-next-line no-await-in-loop
+        await page.activate();
+        // eslint-disable-next-line no-await-in-loop
+        await sleep(300);
+        // eslint-disable-next-line no-await-in-loop
+        await page.clickAt(probe.x, probe.y);
+        // eslint-disable-next-line no-await-in-loop
+        await page.screenshot(join(ARTIFACT_DIR, `submit-click-${attempt}.png`));
+        // Do not assume the click did something: wait for the portal to say so.
+        // eslint-disable-next-line no-await-in-loop
+        const outcome = await waitForSubmitOutcome(page, 15000);
+        if (outcome.ok) {
+          submitted = true;
+          log('portal confirmed the submission');
+          break;
+        }
+        if (outcome.rejected) {
+          log('portal rejected the form:', outcome.text.slice(0, 200));
+        } else {
+          log('no confirmation after the click, retrying');
+        }
+        // eslint-disable-next-line no-await-in-loop
+        await dismissDialogs(page, config);
+        // eslint-disable-next-line no-await-in-loop
+        await sleep(1000);
       }
+      if (submitted) break;
     }
+    writeFileSync(
+      join(ARTIFACT_DIR, 'submit-attempts.json'),
+      JSON.stringify(attempts, null, 2),
+      'utf8',
+    );
     if (!submitted) {
       const dump = await inspectPage(page);
       writeFileSync(join(ARTIFACT_DIR, 'no-submit-button.json'), JSON.stringify(dump, null, 2), 'utf8');
       throw new Error('SUBMIT_BUTTON_NOT_FOUND');
     }
-    await sleep(3000);
 
     // 4b. a confirmation dialog may pop up -> confirm it (dialogs only)
     await dismissDialogs(page, config);
@@ -530,15 +707,15 @@ async function main() {
   } catch (error) {
     log('FAILED:', error.message || error);
     console.log(`FAILED ${error.message || error}`);
-    // A dry run must not touch the state machine, and it must not release the
-    // lock of a submission that may be running right now.
-    if (!dryRun) {
+    // A dry run and a click verification must not touch the state machine, and
+    // they must not release the lock of a submission that may be running now.
+    if (!dryRun && mode !== 'verify-click') {
       markState('failed', { note: String(error.message || error).slice(0, 300) });
     }
     exitCode = 1;
   } finally {
     browser.close();
-    if (!dryRun) {
+    if (!dryRun && mode !== 'verify-click') {
       try {
         unlinkSync(join(APP_ROOT, 'apply.lock'));
       } catch {
